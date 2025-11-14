@@ -81,10 +81,15 @@ using namespace std;
 #define VAR_TYPE_TMPLS     5  //.templates
 #define VAR_TYPE_VARLIST   6  //.variables
 #define VAR_TYPE_OUTLIER   7  //.outlier
+// time-related types
+#define VAR_TYPE_TIMECOL   8  //.time column
+#define VAR_TYPE_TIMEINDEX 9  //.time index
 
 #define MAIN_PAT_NAME      VAR_TYPE_TMPLS//"templates.txt"
 #define SUBV_PAT_NAME      VAR_TYPE_VARLIST//"variables.txt"
 #define OUTL_PAT_NAME      VAR_TYPE_OUTLIER//"templates.outlier"
+#define TIME_COL_NAME      VAR_TYPE_TIMECOL
+#define TIME_INDEX_NAME    VAR_TYPE_TIMEINDEX
 
 #define QTYPE_ALIGN_FULL   0
 #define QTYPE_ALIGN_LEFT   1
@@ -255,8 +260,9 @@ typedef struct SubPattern
           {
             if(lPos !=0 && lPos != lastPos)
             {
-              segCont[segSize] = new char[lPos - lastPos +1]{'\0'};
+              segCont[segSize] = new char[lPos - lastPos + 1];
               strncpy(segCont[segSize], pat + lastPos, lPos - lastPos);
+              segCont[segSize][lPos - lastPos] = '\0'; // Ensure null termination
               segTag[segSize] = SEG_TYPE_CONST;
               segSize++;
             }
@@ -284,8 +290,9 @@ typedef struct SubPattern
       }
       if(lastPos < patLen)
       {
-        segCont[segSize] = new char[patLen - lastPos +1]{'\0'};
+        segCont[segSize] = new char[patLen - lastPos + 1];
         strncpy(segCont[segSize], pat + lastPos, patLen - lastPos);
+        segCont[segSize][patLen - lastPos] = '\0'; // Ensure null termination
         segTag[segSize] = SEG_TYPE_CONST;
         segSize++;
       }
@@ -363,8 +370,9 @@ typedef struct SubPattern
         {
           if(lPos !=0 && lPos != lastPos)//exit the const chars
           {
-            SubSegment[SegSize] = new char[lPos - lastPos +1]{'\0'};
+            SubSegment[SegSize] = new char[lPos - lastPos + 1];
             strncpy(SubSegment[SegSize], content + lastPos, lPos - lastPos);
+            SubSegment[SegSize][lPos - lastPos] = '\0'; // Ensure null termination
             SubSegAttr[SegSize] = SEG_TYPE_CONST;
             SubVars[SegSize] = NULL;
             SegSize++;
@@ -400,8 +408,9 @@ typedef struct SubPattern
     }
     if(lastPos < ContSize)
     {
-      SubSegment[SegSize] = new char[ContSize - lastPos +1]{'\0'};
+      SubSegment[SegSize] = new char[ContSize - lastPos + 1];
       strncpy(SubSegment[SegSize], content + lastPos, ContSize - lastPos);
+      SubSegment[SegSize][ContSize - lastPos] = '\0'; // Ensure null termination
       SubSegAttr[SegSize] = SEG_TYPE_CONST;
       SubVars[SegSize] = NULL;
       SegSize++;

@@ -21,7 +21,7 @@ LIB = $(LIBDIR)/libzstd.a
 
 cc = g++
 EXEC = THULR
-SRCS = main.cpp sampler.cpp Coffer.cpp Encoder.cpp util.cpp LengthParser.cpp template.cpp union.cpp SubPattern.cpp timer.cpp
+SRCS = main.cpp sampler.cpp Coffer.cpp Encoder.cpp util.cpp LengthParser.cpp template.cpp union.cpp SubPattern.cpp timer.cpp TimeParser.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 

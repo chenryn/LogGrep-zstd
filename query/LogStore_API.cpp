@@ -8,6 +8,12 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include "LogStore_API.h"
+#include "var_alias.h"
+#include <ctype.h>
+#include <strings.h>
+
+static bool __contains_ic(const char* text, const char* pat);
+static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB, int& opType);
 
 
 using namespace std;
@@ -39,9 +45,9 @@ LogStoreApi::~LogStoreApi()
 //return success(>0) or failed(<0) flag  
 int LogStoreApi::BootLoader(char* path, char* filename)
 {
-	size_t destLen, srcLen;
-	char cFileTmp[MAX_FILE_NAMELEN] = {'\0'};
-	sprintf(cFileTmp, "%s/%s", path, filename);
+    size_t destLen, srcLen;
+    char cFileTmp[MAX_FILE_NAMELEN] = {'\0'};
+    sprintf(cFileTmp, "%s/%s", path, filename);
 	//load meta header: 5+4+4
 	int ret = LoadGlbMetaHeader(cFileTmp, destLen, srcLen);
 	if(ret <= 0) return -1;
@@ -74,12 +80,22 @@ int LogStoreApi::BootLoader(char* path, char* filename)
 		//ClearCoffer(coffer2);
 		if(ret <= 0) return -8;
 	}
+	
+    char aliasConfigPath[MAX_FILE_NAMELEN] = {'\0'};
+    sprintf(aliasConfigPath, "%s/var_alias.conf", path);
+    VarAliasManager* aliasManager = VarAliasManager::getInstance();
+    aliasManager->setDefaultConfigPath(string(aliasConfigPath));
+    aliasManager->initializeForZip(string(path) + "/" + string(filename));
 	// init global bitmap for caching
 	m_glbExchgLogicmap = new BitMap(m_maxBitmapSize);
 	m_glbExchgPatmap = new BitMap(m_maxBitmapSize);
 	m_glbExchgBitmap = new BitMap(m_maxBitmapSize);
 	m_glbExchgSubBitmap = new BitMap(m_maxBitmapSize);
 	m_glbExchgSubTempBitmap = new BitMap(m_maxBitmapSize);
+
+    // load time column & segment index if present
+    LoadTimeColumn();
+    LoadTimeIndex();
 	return ret;
 }
 
@@ -97,52 +113,123 @@ int LogStoreApi::LoadGlbMetaHeader(char* filename, size_t& destLen, size_t& srcL
 //return entries of meta file
 int LogStoreApi::LoadGlbMetadata(char* filename, size_t destLen, size_t srcLen)
 {
+	// 检查输入参数的有效性
+	if (destLen <= 0 || srcLen <= 0) {
+		SyslogError("无效的压缩数据大小: destLen=%zu, srcLen=%zu\n", destLen, srcLen);
+		return -1;
+	}
+
+	// 检查解压后大小是否过大
+	if (srcLen > MAX_SAFE_DECOMPRESS_SIZE) {
+		SyslogError("解压后数据大小超过安全限制: %zu > %d\n", srcLen, MAX_SAFE_DECOMPRESS_SIZE);
+		return -1;
+	}
+
 	//decompression
-	unsigned char* pZstd = new unsigned char[destLen + 5];
-	fread(pZstd, sizeof(char), destLen, m_fptr);
+	unsigned char* pZstd = nullptr;
+	try {
+		pZstd = new unsigned char[destLen + 5];
+	} catch(std::bad_alloc& e) {
+		SyslogError("内存分配失败: pZstd (大小: %zu): %s\n", destLen + 5, e.what());
+		return -1;
+	}
+
+	size_t readSize = fread(pZstd, sizeof(char), destLen, m_fptr);
+	if (readSize != destLen) {
+		SyslogError("读取压缩数据失败: 预期 %zu 字节，实际读取 %zu 字节\n", destLen, readSize);
+		delete[] pZstd;
+		return -1;
+	}
+
 	size_t decom_buf_size = ZSTD_getFrameContentSize(pZstd, destLen);
-	char* meta = new char[decom_buf_size]{'\0'};
-	int res = ZSTD_decompress(meta, decom_buf_size, pZstd, destLen);
-	if(res != srcLen) return -1;
+	if (decom_buf_size == ZSTD_CONTENTSIZE_ERROR || decom_buf_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+		SyslogError("无法确定解压后大小: %s\n", filename);
+		delete[] pZstd;
+		return -1;
+	}
+
+	// 检查解压后大小与预期大小是否一致
+	if (decom_buf_size != srcLen) {
+		SyslogError("解压后大小与预期不符: 预期=%zu, 实际=%zu\n", srcLen, decom_buf_size);
+		delete[] pZstd;
+		return -1;
+	}
+
+	try {
+		char* meta = new char[decom_buf_size + 5];
+		memset(meta, '\0', decom_buf_size + 5);
+		int res = ZSTD_decompress(meta, decom_buf_size, pZstd, destLen);
+		if(res != srcLen) {
+			SyslogError("解压缩失败: %s, 预期大小 %zu, 实际大小 %d\n", filename, srcLen, res);
+			delete[] meta;
+			delete[] pZstd;
+			return -1;
+		}
 	int offset =0, index =0;
 	char* meta_buffer = new char[128];
+	if (!meta_buffer) {
+		SyslogError("内存分配失败: meta_buffer\n");
+		delete[] meta;
+		delete[] pZstd;
+		return -1;
+	}
+
 	for (char *p= meta; *p && p-meta< srcLen + 5; p++)
 	{
         if (*p == '\n')
 		{
 			meta_buffer[offset] = '\0';
 			Coffer* newCoffer = new Coffer(string(meta_buffer));
+			if (!newCoffer) {
+				SyslogError("内存分配失败: newCoffer\n");
+				delete[] meta;
+				delete[] meta_buffer;
+				delete[] pZstd;
+				return -1;
+			}
+
 			int iname = atoi(newCoffer->filenames.c_str());
-			if(newCoffer ->srcLen > 0)
+			if(newCoffer->srcLen > 0)
 				m_glbMeta[iname] = newCoffer;
-			if(newCoffer->eleLen == -3 && newCoffer ->lines > 0)//var outliers
+			if(newCoffer->eleLen == -3 && newCoffer->lines > 0)//var outliers
 			{
-				LoadVarOutliers(iname, newCoffer ->lines, newCoffer ->srcLen);
+				LoadVarOutliers(iname, newCoffer->lines, newCoffer->srcLen);
 			}	
 			offset=0;
 			index++;
 
 			//for stat
-			if(newCoffer ->lines > 0)
+			if(newCoffer->lines > 0)
 			{
-				Statistic.total_capsule_cnt ++;
+				Statistic.total_capsule_cnt++;
 			}
 
-			if(iname <=0) 
+			if(iname <= 0) 
 			{
 				SyslogError("ErrorMeta:%d filename:%s %s\n", iname, FileName.c_str(), meta_buffer);
 			}
-			SyslogDebug("coffer filenames: %d (%s), srcLen:%d lines: %d eleLen:%d\n",iname, FormatVarName(iname), newCoffer ->srcLen, newCoffer ->lines, newCoffer ->eleLen);
+			SyslogDebug("coffer filenames: %d (%s), srcLen:%d lines: %d eleLen:%d\n", iname, FormatVarName(iname), newCoffer->srcLen, newCoffer->lines, newCoffer->eleLen);
 		}
         else
 		{
-			meta_buffer[offset++] = *p;
+			if (offset < 127) { // 防止缓冲区溢出
+				meta_buffer[offset++] = *p;
+			} else {
+				SyslogError("meta_buffer溢出，行太长\n");
+			}
 		}
 	}
-	delete [] meta;
-	delete [] meta_buffer;
-	delete [] pZstd;
+
+	delete[] meta;
+	delete[] meta_buffer;
+	delete[] pZstd;
 	return index;
+	} catch(std::bad_alloc& e) {
+		SyslogError("内存分配失败: %s\n", e.what());
+		delete[] pZstd;
+		return -1;
+	}
+
 }
 
 //E18_V2.outlier: srcLen:87573 lines: 5253 eleLen:-1
@@ -513,36 +600,167 @@ int LogStoreApi::AddSubPatternToMap(int vid, char type, char* content)
 //decompress patterns
 int LogStoreApi::DeCompressCapsule(int patName, OUT Coffer* &coffer, int type)
 {
-	int ret =1;
+	int ret = 1;
 	//if find in cache, then fetch directly
 	coffer = m_glbMeta[patName];
-	if(coffer == NULL || m_fptr == NULL) ret=-1; //error patName
-	//if(coffer == NULL || m_fptr == NULL || coffer->destLen <0 || coffer->srcLen <0) ret=-1; //error patName
-	else if(coffer->data == NULL)//data not be cached, need decompress from file
-	{ 
-		timeval tt1 = ___StatTime_Start();
-		int res = coffer->readFile(m_fptr, m_glbMetaHeadLen);
-		if(res < 0) ret=-2;
-		else
-		{
-			res = coffer->decompress();
-			if(res < 0) ret=-3;
-		}
-
-		double tt2= ___StatTime_End(tt1);
-		//for stat
-		if(type != 1)
-		{
-			SyslogDebug("decompress[%d]: %d %s %d %d\n", type, patName, FormatVarName(patName), coffer->eleLen, coffer->lines);
-			Statistic.total_decom_capsule_cnt++;
-			Statistic.total_decom_capsule_time +=tt2; 
-		}
+	if(coffer == NULL || m_fptr == NULL) {
+		SyslogError("错误: coffer或文件指针为空，patName=%d\n", patName);
+		return -1; //error patName
 	}
-	if(ret <0)
+	
+	// 如果数据已经被缓存，直接返回
+	if(coffer->data != NULL) {
+		return ret;
+	}
+	
+	// 检查压缩数据的大小是否合理
+	if(coffer->destLen <= 0 || coffer->srcLen <= 0) {
+		SyslogError("错误: 无效的压缩数据大小，patName=%d, destLen=%d, srcLen=%d\n", 
+			patName, coffer->destLen, coffer->srcLen);
+		return -1;
+	}
+	
+	// 检查解压后数据大小是否过大（防止内存分配失败）
+	if(coffer->srcLen > MAX_SAFE_DECOMPRESS_SIZE) {
+		SyslogError("错误: 解压后数据大小超过安全限制，patName=%d, srcLen=%d\n", 
+			patName, coffer->srcLen);
+		return -1;
+	}
+
+	timeval tt1 = ___StatTime_Start();
+	
+	// 读取压缩数据
+	int res = coffer->readFile(m_fptr, m_glbMetaHeadLen);
+	if(res < 0) {
+		SyslogError("错误: 读取压缩数据失败，patName=%d\n", patName);
+		return -2;
+	}
+	
+	// 在解压缩前检查压缩数据的有效性
+	size_t decom_buf_size = ZSTD_getFrameContentSize(coffer->cdata, coffer->destLen);
+	if(decom_buf_size == ZSTD_CONTENTSIZE_ERROR || decom_buf_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+		SyslogError("错误: 无法确定解压后大小或压缩数据无效，patName=%d\n", patName);
+		return -3;
+	}
+	
+	// 检查解压后大小与预期大小是否一致
+	if(decom_buf_size != (size_t)coffer->srcLen) {
+		SyslogError("错误: 解压后大小与预期不符，patName=%d, 预期=%d, 实际=%zu\n", 
+			patName, coffer->srcLen, decom_buf_size);
+		return -3;
+	}
+	
+	// 解压缩数据
+	try {
+		res = coffer->decompress();
+		if(res < 0) {
+			SyslogError("错误: 解压缩失败，patName=%d\n", patName);
+			ret = -3;
+		}
+	} catch(std::bad_alloc& e) {
+		SyslogError("错误: 解压缩内存分配失败，patName=%d, 错误信息: %s\n", patName, e.what());
+		ret = -4;
+	} catch(std::exception& e) {
+		SyslogError("错误: 解压缩异常，patName=%d, 错误信息: %s\n", patName, e.what());
+		ret = -3;
+	}
+
+	double tt2 = ___StatTime_End(tt1);
+	//for stat
+	if(type != 1 && ret > 0)
 	{
-		SyslogError("Error: not find varname:%s in meta:%s!\n",FormatVarName(patName), FileName.c_str());
+		SyslogDebug("decompress[%d]: %d %s %d %d\n", type, patName, FormatVarName(patName), coffer->eleLen, coffer->lines);
+		Statistic.total_decom_capsule_cnt++;
+		Statistic.total_decom_capsule_time += tt2; 
+	}
+	
+	if(ret < 0)
+	{
+		SyslogError("Error: not find varname:%s in meta:%s!\n", FormatVarName(patName), FileName.c_str());
 	}
 	return ret;
+}
+
+int LogStoreApi::LoadTimeColumn()
+{
+    Coffer* coffer = NULL;
+    if(m_glbMeta.find(TIME_COL_NAME) == m_glbMeta.end()) return 0;
+    int ret = DeCompressCapsule(TIME_COL_NAME, coffer);
+    if(ret <= 0) return 0;
+    if(!coffer || !coffer->data) return 0;
+    m_timeValues.clear();
+    int count = coffer->lines;
+    int width = coffer->eleLen;
+    m_timeValues.reserve(count);
+    for(int i=0;i<count;i++){
+        const char* p = coffer->data + i*width;
+        char buf[32]; int n=0;
+        // trim leading spaces
+        while(n<width && p[n]==' ') n++;
+        int mlen = width-n; if(mlen > 31) mlen = 31;
+        memcpy(buf, p+n, mlen); buf[mlen] = '\0';
+        long long v = atoll(buf);
+        m_timeValues.push_back(v);
+    }
+    return m_timeValues.size();
+}
+
+int LogStoreApi::LoadTimeIndex()
+{
+    Coffer* coffer = NULL;
+    if(m_glbMeta.find(TIME_INDEX_NAME) == m_glbMeta.end()) return 0;
+    int ret = DeCompressCapsule(TIME_INDEX_NAME, coffer);
+    if(ret <= 0) return 0;
+    if(!coffer || !coffer->data) return 0;
+    m_segments.clear();
+    int sLen = coffer->srcLen;
+    int idx = 0; int field = 0; long long segid=0; SegInfo seg{}; char numbuf[64]; int nb=0;
+    for(int i=0;i<sLen;i++){
+        char c = coffer->data[i];
+        if(c=='\n'){
+            if(field==5){ m_segments.push_back(seg); }
+            field=0; nb=0; memset(&seg,0,sizeof(seg));
+            continue;
+        }
+        if(c==' '){
+            numbuf[nb]='\0';
+            long long val = atoll(numbuf);
+            if(field==0) { segid=val; }
+            else if(field==1) { seg.sline=(int)val; }
+            else if(field==2) { seg.eline=(int)val; }
+            else if(field==3) { seg.tmin=val; }
+            else if(field==4) { seg.tmax=val; }
+            field++; nb=0; continue;
+        }
+        if(nb<63){ numbuf[nb++]=c; }
+    }
+    return m_segments.size();
+}
+
+BitMap* LogStoreApi::BuildTimeBitmap(long long start_ms, long long end_ms)
+{
+    if(m_timeValues.empty()) return NULL;
+    BitMap* bm = new BitMap(m_timeValues.size());
+    for(size_t i=0;i<m_timeValues.size();i++){
+        long long v = m_timeValues[i];
+        if(v >= start_ms && v <= end_ms){
+            bm->Union((int)i);
+        }
+    }
+    return bm;
+}
+
+void LogStoreApi::ApplyTimeFilterToBitmaps(LISTBITMAPS& bitmaps, long long start_ms, long long end_ms)
+{
+    BitMap* tbm = BuildTimeBitmap(start_ms, end_ms);
+    if(!tbm) return;
+    // intersect for each pattern bitmap except outliers which has its own count
+    for(auto &kv : bitmaps){
+        if(kv.first == OUTL_PAT_NAME) continue;
+        if(kv.second == NULL) continue;
+        kv.second->Inset(tbm);
+    }
+    delete tbm;
 }
 
 //load file segment to mem using mmap, abandoned
@@ -1445,7 +1663,8 @@ int LogStoreApi::GetVals_AxB_Dic(int varName, const char* queryA, const char* qu
 		varfname = varName +  VAR_TYPE_ENTRY;
 		int entryLen = m_glbMeta[varfname]->eleLen;
 		//dic search result may be bigger than 1
-		char* paddingStr = new char[MAX_DICENTY_LEN * num]{'\0'};
+		char* paddingStr = new char[MAX_DICENTY_LEN * num];
+		memset(paddingStr, '\0', MAX_DICENTY_LEN * num);
 		for(int i=0; i< num; i++)
 		{
 			//index start from 1
@@ -2121,7 +2340,8 @@ int LogStoreApi::GetPatternById(int patId, OUT char** patBody)
 		int len = itor->second->ContSize;
 		if(*patBody == NULL)
 		{
-			*patBody = new char[len + 1]{'\0'};
+			*patBody = new char[len + 1];
+			(*patBody)[len] = '\0'; // Ensure null termination
 		}
 		strncpy(*patBody, itor->second->Content, len);
 		return len;
@@ -2143,14 +2363,20 @@ int LogStoreApi::GetVariablesByPatId(int patId, RegMatch *regResult)
 //select vals -P E10 -V V5~0 -reg 5699476115821218558   2
 int LogStoreApi::GetValuesByVarName_Reg(int varName, const char* regPattern, OUT char* vars, OUT BitMap* bitmap)
 {
-	int num = QueryByBM_Union(varName, regPattern, QTYPE_ALIGN_ANY, bitmap);
-	bitmap->Reset();
-	num = QueryInMmapByKMP(varName, regPattern, bitmap);
-	for(int i=0;i<num;i++)
-	{
-		//SyslogDebug("KMP bitmap:%d\n", bitmap->GetIndex(i));
-	}
-	return num;
+    int num = QueryByBM_Union(varName, regPattern, QTYPE_ALIGN_ANY, bitmap);
+    SyslogDebug("QueryByBM_Union 返回 num=%d\n", num);
+    for(int i=0;i<num;i++)
+    {
+        SyslogDebug("BM_Union bitmap:%d\n", bitmap->GetIndex(i));
+    }
+    bitmap->Reset();
+    num = QueryInMmapByKMP(varName, regPattern, bitmap);
+    SyslogDebug("QueryInMmapByKMP 返回 num=%d\n", num);
+    for(int i=0;i<num;i++)
+    {
+        SyslogDebug("KMP bitmap:%d\n", bitmap->GetIndex(i));
+    }
+    return num;
 }
 
 int LogStoreApi::GetValuesByPatId_VarId_Reg(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT char* vars, BitMap* bitmap)
@@ -2678,11 +2904,149 @@ int LogStoreApi::Search_AxB_InPattern_Logic(LogPattern* logPat, char* queryStrA,
 
 int LogStoreApi::Search_SingleSegment(char *querySeg, OUT LISTBITMAPS &bitmaps)
 {
-	char *wArray[MAX_CMD_PARAMS_COUNT];//split by wildcard
-	//the style maybe:  	abcd, ab*, a*d, *cd, *bc*.
-	//spit seq with '*':	abcd, ab,  [a,b], cd, bc.
-	int mCount = Split_NoDelim(querySeg, WILDCARD, wArray);
-	int num = 0;
+    char* pos = NULL;
+    pos = strchr(querySeg, ':');
+    bool aliasHit = false;
+    if(pos && pos != querySeg)
+    {
+        int alen = pos - querySeg;
+        std::string alias(querySeg, alen);
+        std::string raw(pos + 1);
+        std::string value = raw;
+        bool optStrict = false;
+        bool optCI = false;
+        size_t bar = raw.find('|');
+        if(bar != std::string::npos){
+            value = raw.substr(0, bar);
+            std::string opts = raw.substr(bar+1);
+            if(opts.find("strict") != std::string::npos) optStrict = true;
+            if(opts.find("ci") != std::string::npos) optCI = true;
+        }
+        VarAliasManager* mgr = VarAliasManager::getInstance();
+        std::vector<int> vids = mgr->getVarIds(alias);
+        if(!vids.empty())
+        {
+            short tag = 0;
+            for(size_t idx=0; idx<vids.size(); idx++)
+            {
+                int varId = vids[idx];
+                int pid = (varId & 0xFFFF0000);
+                LISTPATS::iterator itor = m_patterns.find(pid);
+                if(itor != m_patterns.end())
+                {
+                    BitMap* bitmap = new BitMap(itor->second->Count);
+                    int bitmapLen = 0;
+                    LISTSUBPATS::iterator isub = m_subpatterns.find(varId);
+                    if(isub != m_subpatterns.end() && isub->second->Type == VAR_TYPE_VAR)
+                    {
+                        int varfname = varId + VAR_TYPE_VAR;
+                        long tmpA=0,tmpB=0; int opt=0;
+                        if(__parse_numeric_expr(value, tmpA, tmpB, opt))
+                        {
+                            bitmapLen = FilterNumericVar(varfname, value.c_str(), bitmap);
+                        }
+                        else
+                        {
+                            bitmapLen = QueryByBM_Union(varfname, value.c_str(), QTYPE_ALIGN_ANY, bitmap);
+                        }
+                    }
+                    else
+                    {
+                        bitmap->SetSize();
+                        bitmapLen = SearchInVar_Pushdown(varId, (char*)value.c_str(), tag, QTYPE_ALIGN_ANY, bitmap);
+                    }
+                    if(bitmapLen > 0 || bitmap->BeSizeFul())
+                    {
+                        aliasHit = true;
+                        LISTBITMAPS::iterator ib = bitmaps.find(pid);
+                        if(ib != bitmaps.end() && ib->second != NULL)
+                        {
+                            ib->second->Union(bitmap);
+                            delete bitmap;
+                        }
+                        else
+                        {
+                            bitmaps[pid] = bitmap;
+                        }
+                    }
+                    else
+                    {
+                        delete bitmap;
+                        if(!optStrict){
+                            BitMap* cbitmap = new BitMap(itor->second->Count);
+                            if(!optCI){
+                                SearchSingleInPattern(itor->second, (char*)value.c_str(), 0, cbitmap);
+                            } else {
+                                for(int si=0; si< itor->second->SegSize; si++){
+                                    if(itor->second->SegAttr[si] != SEG_TYPE_VAR){
+                                        if(strcasestr(itor->second->Segment[si], value.c_str())){ cbitmap->SetSize(); break; }
+                                    }
+                                }
+                            }
+                            if(cbitmap->GetSize() > 0 || cbitmap->BeSizeFul())
+                            {
+                                aliasHit = true;
+                                LISTBITMAPS::iterator ib = bitmaps.find(pid);
+                                if(ib != bitmaps.end() && ib->second != NULL)
+                                {
+                                    ib->second->Union(cbitmap);
+                                    delete cbitmap;
+                                }
+                                else
+                                {
+                                    bitmaps[pid] = cbitmap;
+                                }
+                            }
+                            else
+                            {
+                                delete cbitmap;
+                            }
+                        }
+                    }
+                }
+            }
+            if(aliasHit) return 0;
+            if(!optStrict){
+                LISTPATS::iterator pit = m_patterns.begin();
+                for (; pit != m_patterns.end(); pit++)
+                {
+                    BitMap* cbitmap = new BitMap(pit->second->Count);
+                    if(!optCI){
+                        SearchSingleInPattern(pit->second, (char*)value.c_str(), 0, cbitmap);
+                    } else {
+                        for(int si=0; si< pit->second->SegSize; si++){
+                            if(pit->second->SegAttr[si] != SEG_TYPE_VAR){
+                                if(strcasestr(pit->second->Segment[si], value.c_str())){ cbitmap->SetSize(); break; }
+                            }
+                        }
+                    }
+                    if(cbitmap->GetSize() > 0 || cbitmap->BeSizeFul())
+                    {
+                        LISTBITMAPS::iterator ib = bitmaps.find(pit->first);
+                        if(ib != bitmaps.end() && ib->second != NULL)
+                        {
+                            ib->second->Union(cbitmap);
+                            delete cbitmap;
+                        }
+                        else
+                        {
+                            bitmaps[pit->first] = cbitmap;
+                        }
+                    }
+                    else
+                    {
+                        delete cbitmap;
+                    }
+                }
+            }
+            return 0;
+        }
+    }
+    char *wArray[MAX_CMD_PARAMS_COUNT];//split by wildcard
+    //the style maybe:  	abcd, ab*, a*d, *cd, *bc*.
+    //spit seq with '*':	abcd, ab,  [a,b], cd, bc.
+    int mCount = Split_NoDelim(querySeg, WILDCARD, wArray);
+    int num = 0;
 	if(mCount == 1)//abcd, ab*, *cd, *bc*.
 	{
 		short queryStrTag = GetStrTag(wArray[0], strlen(wArray[0]));
@@ -3676,15 +4040,48 @@ int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT 
 
 int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum)
 {
-	LISTBITMAPS bitmaps;
-	//only one segment
-	if(argCount == 1)
-	{
-		LISTSESSIONS::iterator ifind = m_sessions.find(args[0]);
-		if(ifind == m_sessions.end())
-		{
-			timeval tt1 = ___StatTime_Start();
-			Search_SingleSegment(args[0], bitmaps);
+    LISTBITMAPS bitmaps;
+    //only one segment
+    if(argCount == 1)
+    {
+    char* colon = strchr(args[0], ':');
+    if(colon && colon != args[0])
+    {
+        std::string raw = std::string(colon + 1);
+        std::string value = raw;
+        bool optStrict = false;
+        size_t bar = raw.find('|');
+        if(bar != std::string::npos){
+            value = raw.substr(0, bar);
+            std::string opts = raw.substr(bar+1);
+            if(opts.find("strict") != std::string::npos) optStrict = true;
+        }
+        timeval tt1 = ___StatTime_Start();
+        Search_SingleSegment((char*)value.c_str(), bitmaps);
+        RunStatus.SearchPatternTime = ___StatTime_End(tt1);
+        timeval tt2 = ___StatTime_Start();
+        BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
+        bitmap_outlier->SetSize();
+        if(!optStrict){
+            GetOutliers_SinglToken((char*)value.c_str(), bitmap_outlier);
+        }
+        else
+        {
+            if(bitmap_outlier->GetSize() == DEF_BITMAP_FULL){ bitmap_outlier->Reset(); }
+        }
+        bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
+        RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
+        RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+        SyslogPerf("It takes %lfs to single query.\n",RunStatus.SearchPatternTime);
+        SyslogPerf("It takes %lfs to single outliers query.\n",RunStatus.SearchOutlierTime);
+        }
+        else
+        {
+        LISTSESSIONS::iterator ifind = m_sessions.find(args[0]);
+        if(ifind == m_sessions.end())
+        {
+            timeval tt1 = ___StatTime_Start();
+            Search_SingleSegment(args[0], bitmaps);
 			RunStatus.SearchPatternTime = ___StatTime_End(tt1);
 			timeval tt2 = ___StatTime_Start();
 			BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
@@ -3708,9 +4105,10 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
 			RunStatus.SearchPatternTime = ___StatTime_End(tt1);
 			RunStatus.SearchOutlierTime = 0;
 			RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
-			SyslogPerf("It takes %lfs to single query with session cache(cur: %d items).\n",RunStatus.SearchTotalTime, m_sessions.size());
-		}
-	}
+            SyslogPerf("It takes %lfs to single query with session cache(cur: %d items).\n",RunStatus.SearchTotalTime, m_sessions.size());
+        }
+        }
+    }
 	else//multi segs, must align from the second segment
 	{
 		int flag = IsSearchWithLogic(args, argCount);
@@ -3824,23 +4222,271 @@ int LogStoreApi::SearchByReg(const char *regPattern)
 	return 0;
 }
 
+// #include "var_alias.h"
+
 char sName[128]={'\0'};
 char* LogStoreApi::FormatVarName(int varName)
 {
-	memset(sName, '\0', 128);
-	if(varName <= 15)
-		sprintf(sName, "%d",varName);
-	else
-	{
-		int e = varName >>16;
-		int v = (varName >>8) & 0xFF;
-		int s = (varName >>4) & 0x0F;
-		int t = varName & 0x0F;
-		if(t == VAR_TYPE_SUB)
-			sprintf(sName, "%d_%d~%d.%d",e,v,s,t);
-		else
-			sprintf(sName, "%d_%d.%d",e,v,t);
-	}
-	return sName;
+    memset(sName, '\0', 128);
+    VarAliasManager* aliasManager = VarAliasManager::getInstance();
+    std::string alias = aliasManager->getAlias(varName);
+    if (!alias.empty()) {
+        strncpy(sName, alias.c_str(), 127);
+        sName[127] = '\0';
+        return sName;
+    }
+    if(varName <= 15)
+        sprintf(sName, "%d",varName);
+    else
+    {
+        int e = varName >>16;
+        int v = (varName >>8) & 0xFF;
+        int s = (varName >>4) & 0x0F;
+        int t = varName & 0x0F;
+        if(t == VAR_TYPE_SUB)
+            sprintf(sName, "%d_%d~%d.%d",e,v,s,t);
+        else
+            sprintf(sName, "%d_%d.%d",e,v,t);
+    }
+    return sName;
 }
 
+int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out)
+{
+    LISTBITMAPS bitmaps;
+    int ret = 0;
+    if(argCount == 1)
+    {
+        timeval tt1 = ___StatTime_Start();
+        Search_SingleSegment(args[0], bitmaps);
+        RunStatus.SearchPatternTime = ___StatTime_End(tt1);
+        timeval tt2 = ___StatTime_Start();
+        BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
+        bitmap_outlier->SetSize();
+        GetOutliers_SinglToken(args[0], bitmap_outlier);
+        bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
+        RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
+        RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+        ret = 1;
+    }
+    else
+    {
+        int flag = IsSearchWithLogic(args, argCount);
+        if(flag == 0)
+        {
+            char queryChars[MAX_PATTERN_SIZE]={'\0'};
+            RecombineString(args, 0, argCount-1, queryChars);
+            string queryStr(queryChars);
+            timeval tt1 = ___StatTime_Start();
+            Search_MultiSegments(args, argCount, bitmaps);
+            RunStatus.SearchPatternTime = ___StatTime_End(tt1);
+            timeval tt2 = ___StatTime_Start();
+            BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
+            bitmap_outlier->SetSize();
+            GetOutliers_MultiToken(args, 0, argCount-1, bitmap_outlier);
+            bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
+            RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
+            RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+            ret = 1;
+        }
+        else
+        {
+            timeval tt1 = ___StatTime_Start();
+            SearchByLogic(args, argCount, bitmaps);
+            RunStatus.SearchTotalTime = ___StatTime_End(tt1);
+            ret = 1;
+        }
+    }
+
+    int totalCnt = 0;
+    json_out.clear();
+    json_out.append("[");
+    bool firstItem = true;
+
+    LISTBITMAPS::iterator itor = bitmaps.begin();
+    for(; itor != bitmaps.end(); ++itor)
+    {
+        int pid = itor->first;
+        BitMap* bitmap = itor->second;
+        if(bitmap == NULL) continue;
+        int entryCnt = bitmap->BeSizeFul() ? (pid==OUTL_PAT_NAME? bitmap->GetSize() : m_patterns[pid]->Count) : bitmap->GetSize();
+        int doCnt = entryCnt >= (matNum - totalCnt) ? (matNum - totalCnt) : entryCnt;
+        if(doCnt <= 0) { delete bitmap; continue; }
+
+        if(pid == OUTL_PAT_NAME)
+        {
+            for(int i=0;i<doCnt;i++)
+            {
+                int idx = bitmap->GetIndex(i);
+                const char* line = m_outliers[idx];
+                if(!firstItem) json_out.append(",");
+                firstItem = false;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%d", idx+1);
+                json_out.append("{\"log_line\":\"");
+                // naive escape
+                for(const char* p=line; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else if(*p=='\n' || *p=='\r'){ } else { json_out.push_back(*p);} }
+                json_out.append("\",\"template_id\":-1,\"template\":\"OUTLIER\",\"line_number\":");
+                json_out.append(buf);
+                json_out.append("}");
+                totalCnt++;
+                if(totalCnt >= matNum) break;
+            }
+        }
+        else
+        {
+            LogPattern* pat = m_patterns[pid];
+            CELL* output = new CELL[pat->SegSize];
+            for(int i=0;i< pat->SegSize;i++)
+            {
+                if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
+                {
+                    output[i] = pat->Segment[i];
+                }
+                else
+                {
+                    output[i] = new char[MAX_VALUE_LEN * doCnt];
+                    memset(output[i], '\0', MAX_VALUE_LEN * doCnt);
+                    Materializ_Pats(pat->VarNames[i], bitmap, doCnt, output[i]);
+                }
+            }
+            for(int k=0;k<doCnt;k++)
+            {
+                if(!firstItem) json_out.append(",");
+                firstItem = false;
+                json_out.append("{\"log_line\":\"");
+                char linebuf[MAX_LINE_SIZE];
+                memset(linebuf, '\0', MAX_LINE_SIZE);
+                for(int i=0;i< pat->SegSize;i++)
+                {
+                    if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
+                    {
+                        strncat(linebuf, output[i], MAX_LINE_SIZE - strlen(linebuf) -1);
+                    }
+                    else
+                    {
+                        strncat(linebuf, output[i] + MAX_VALUE_LEN * k, MAX_LINE_SIZE - strlen(linebuf) -1);
+                    }
+                }
+                for(const char* p=linebuf; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else if(*p=='\n' || *p=='\r'){ } else { json_out.push_back(*p);} }
+                char bufIdx[64]; snprintf(bufIdx, sizeof(bufIdx), "%d", bitmap->GetIndex(k)+1);
+                json_out.append("\",\"template_id\":");
+                char bufPid[64]; snprintf(bufPid, sizeof(bufPid), "%d", pid);
+                json_out.append(bufPid);
+                json_out.append(",\"template\":\"");
+                for(const char* p=pat->Content; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else { json_out.push_back(*p);} }
+                json_out.append("\",\"line_number\":");
+                json_out.append(bufIdx);
+                json_out.append("}");
+                totalCnt++;
+                if(totalCnt >= matNum) break;
+            }
+            for(int i=0;i< pat->SegSize;i++)
+            {
+                if(pat->SegAttr[i] != SEG_TYPE_CONST && pat->SegAttr[i] != SEG_TYPE_DELIM)
+                {
+                    delete[] output[i];
+                    output[i] = NULL;
+                }
+            }
+            delete[] output;
+        }
+        delete bitmap;
+        if(totalCnt >= matNum) break;
+    }
+    json_out.append("]");
+    return totalCnt;
+}
+
+static bool __contains_ic(const char* text, const char* pat){
+    if(!text || !pat) return false;
+    int n = strlen(text);
+    int m = strlen(pat);
+    if(m == 0) return true;
+    for(int i=0;i<=n-m;i++){
+        int j=0;
+        while(j<m && tolower(text[i+j]) == tolower(pat[j])) j++;
+        if(j==m) return true;
+    }
+    return false;
+}
+static bool __contains_ic(const char* text, const char* pat);
+static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB, int& opType);
+
+static void __trim(std::string& s){
+    size_t i = s.find_first_not_of(" \t");
+    if(i == std::string::npos){ s.clear(); return; }
+    size_t j = s.find_last_not_of(" \t");
+    s = s.substr(i, j - i + 1);
+}
+static bool __startswith(const std::string& s, const char* p){ return s.compare(0, (int)strlen(p), p) == 0; }
+static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB, int& opType){
+    std::string s = expr; __trim(s); if(s.empty()) return false;
+    size_t dots = s.find("..");
+    if(dots != std::string::npos){
+        std::string a = s.substr(0,dots); std::string b = s.substr(dots+2);
+        __trim(a); __trim(b);
+        char* ea=NULL; char* eb=NULL; long va = strtol(a.c_str(), &ea, 10); long vb = strtol(b.c_str(), &eb, 10);
+        if(ea && *ea == '\0' && eb && *eb == '\0'){ outA=va; outB=vb; opType=6; return true; } else { return false; }
+    }
+    int t = -1; const char* rest = s.c_str();
+    if(__startswith(s, ">=")){ t=3; rest = s.c_str()+2; }
+    else if(__startswith(s, "<=")){ t=4; rest = s.c_str()+2; }
+    else if(__startswith(s, "==")){ t=0; rest = s.c_str()+2; }
+    else if(__startswith(s, "!=")){ t=5; rest = s.c_str()+2; }
+    else if(__startswith(s, ">")){ t=1; rest = s.c_str()+1; }
+    else if(__startswith(s, "<")){ t=2; rest = s.c_str()+1; }
+    else { t=0; rest = s.c_str(); }
+    std::string numStr(rest); __trim(numStr);
+    char* e=NULL; long v = strtol(numStr.c_str(), &e, 10);
+    if(e && *e == '\0'){ outA=v; opType=t; return true; }
+    return false;
+}
+
+int LogStoreApi::FilterNumericVar(int varfname, const char* expr, BitMap* bitmap){
+    long A=0,B=0; int op=0; if(!__parse_numeric_expr(std::string(expr), A, B, op)) return 0;
+    Coffer* meta=nullptr; int ret = DeCompressCapsule(varfname, meta, 1); if(ret <= 0) return 0;
+    int matched = 0;
+    if(meta->eleLen > 0){
+        for(int i=0; i< meta->lines; i++){
+            char buf[MAX_VALUE_LEN]={0};
+            RemovePadding(meta->data + i * meta->eleLen, meta->eleLen, buf);
+            char* e=nullptr; long v = strtol(buf, &e, 10);
+            if(!(e && (*e=='\0' || isspace(*e)))) continue;
+            bool ok=false;
+            switch(op){
+                case 0: ok = (v == A); break;
+                case 1: ok = (v >  A); break;
+                case 2: ok = (v <  A); break;
+                case 3: ok = (v >= A); break;
+                case 4: ok = (v <= A); break;
+                case 5: ok = (v != A); break;
+                case 6: ok = (v >= A && v <= B); break;
+                default: ok=false; break;
+            }
+            if(ok){ bitmap->Union(i); matched++; }
+        }
+    } else {
+        int lineIdx=0; int offset=0; char* p = meta->data; int sLen = meta->srcLen; char buf[MAX_VALUE_LEN]={0};
+        while(p && (p - meta->data) < sLen){
+            offset = 0; while(*p && *p != '\n' && (p - meta->data) < sLen){ buf[offset++] = *p; p++; }
+            buf[offset] = '\0';
+            char* e=nullptr; long v = strtol(buf, &e, 10);
+            if(e && (*e=='\0' || isspace(*e))){
+                bool ok=false;
+                switch(op){
+                    case 0: ok = (v == A); break;
+                    case 1: ok = (v >  A); break;
+                    case 2: ok = (v <  A); break;
+                    case 3: ok = (v >= A); break;
+                    case 4: ok = (v <= A); break;
+                    case 5: ok = (v != A); break;
+                    case 6: ok = (v >= A && v <= B); break;
+                }
+                if(ok){ bitmap->Union(lineIdx); matched++; }
+            }
+            lineIdx++; if(*p == '\n') p++; else break;
+        }
+    }
+    return matched;
+}

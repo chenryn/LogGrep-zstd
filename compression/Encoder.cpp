@@ -252,4 +252,47 @@ void Encoder::output(string zip_path, int typ){
     fclose(zipFile);
 }
 
+void Encoder::serializeTimeColumn(const std::vector<long long>& times){
+    if(times.empty()){
+        Coffer* nCoffer = new Coffer(to_string(TYPE_TIME_COL << POS_TYPE), NULL, 0, 0, 0, -1);
+        data.push_back(nCoffer);
+        return;
+    }
+    // encode as fixed-width 64-bit decimal strings for simplicity
+    int paddingSize = 13; // enough for epoch ms
+    string longStr;
+    longStr.reserve(times.size() * (paddingSize));
+    for(size_t i=0;i<times.size();i++){
+        string v = to_string(times[i]);
+        if((int)v.size() < paddingSize){
+            longStr += string(paddingSize - v.size(), ' ') + v;
+        } else {
+            longStr += v;
+        }
+    }
+    Coffer* nCoffer = new Coffer(to_string(TYPE_TIME_COL << POS_TYPE), longStr, longStr.size(), times.size(), 8, paddingSize);
+    data.push_back(nCoffer);
+}
+
+void Encoder::serializeTimeIndex(const std::vector<int>& seg_starts,
+                                const std::vector<int>& seg_ends,
+                                const std::vector<long long>& seg_min,
+                                const std::vector<long long>& seg_max){
+    string longStr;
+    int n = seg_starts.size();
+    for(int i=0;i<n;i++){
+        longStr += to_string(i);
+        longStr += " ";
+        longStr += to_string(seg_starts[i]);
+        longStr += " ";
+        longStr += to_string(seg_ends[i]);
+        longStr += " ";
+        longStr += to_string(seg_min[i]);
+        longStr += " ";
+        longStr += to_string(seg_max[i]);
+        longStr += "\n";
+    }
+    Coffer* nCoffer = new Coffer(to_string(TYPE_TIME_INDEX << POS_TYPE), longStr, longStr.size(), n, 8, -1);
+    data.push_back(nCoffer);
+}
 

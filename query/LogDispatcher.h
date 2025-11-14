@@ -29,14 +29,16 @@ private:
 	void * SearchByWildcard_pthread_exe();
 
 public:
-	int Connect(char* dirPath);
-	int IsConnect();
-	void DisConnect();
+    int Connect(char* dirPath);
+    int IsConnect();
+    void DisConnect();
 
-	int SearchByWildcard(char *args[MAX_CMD_ARG_COUNT], int argCount);
-	int SearchByWildcard_Seq(char *args[MAX_CMD_ARG_COUNT], int argCount);
-	int SearchByWildcard_Thread(char *args[MAX_CMD_ARG_COUNT], int argCount);
-	static void * SearchByWildcard_pthread(void *ptr);
+    int SearchByWildcard(char *args[MAX_CMD_ARG_COUNT], int argCount);
+    int SearchByWildcard_Seq(char *args[MAX_CMD_ARG_COUNT], int argCount);
+    int SearchByWildcard_Thread(char *args[MAX_CMD_ARG_COUNT], int argCount);
+    static void * SearchByWildcard_pthread(void *ptr);
+    int GetRunningStatus(OUT RunningStatus& out);
+    int SearchByWildcard_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out);
 };
 
 #endif

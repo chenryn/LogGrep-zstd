@@ -45,8 +45,14 @@ typedef char* CELL;
 
 typedef int(*pLoadPatCallback)(char*);
 
+// 前向声明
+class StatisticsAPI;
+
 class LogStoreApi
 {
+	// 友元声明，允许 StatisticsAPI 访问私有方法
+	friend class StatisticsAPI;
+	
 public:
 	LogStoreApi();
 	~LogStoreApi();
@@ -70,10 +76,16 @@ private:
 	BitMap* m_glbExchgPatmap;//to cache bitmap on pats
 	BitMap* m_glbExchgBitmap;//to cache bitmap on vars
 	BitMap* m_glbExchgSubBitmap;//to cache bitmap on subvars
-	BitMap* m_glbExchgSubTempBitmap;//to cache bitmap on subvars while multi-pushdown
+    BitMap* m_glbExchgSubTempBitmap;//to cache bitmap on subvars while multi-pushdown
+    // time-related caches
+    std::vector<long long> m_timeValues;
+    struct SegInfo { int sline; int eline; long long tmin; long long tmax; };
+    std::vector<SegInfo> m_segments;
 
 	//int maxCnt;
 	
+	// 变量别名配置文件路径
+	string VarAliasConfigPath;
 
 public:
 	RunningStatus RunStatus;
@@ -88,14 +100,19 @@ private:
 	int DeepCloneMap(LISTBITMAPS source, LISTBITMAPS& des);
 
 	int BootLoader(char* path, char* file);
-	int LoadGlbMetaHeader(char* filename, size_t& desLen, size_t& srcLen);
-	int LoadGlbMetadata(char* filename, size_t desLen, size_t srcLen);
-	int LoadMainPatternToGlbMap(IN char* deCompressedBuf, IN int srcLen);
-	int LoadSubPatternToGlbMap(IN char* deCompressedBuf, IN int srcLen);
-	int AddMainPatternToMap(char etag, int eid, int count, char* content);
-	int AddSubPatternToMap(int vid, char type, char* content);
-	int LoadOutliers(IN char* deCompressedBuf, int sLen, int lineCount);
-	int LoadVarOutliers(int filename, int lines, int srcLen);
+    int LoadGlbMetaHeader(char* filename, size_t& desLen, size_t& srcLen);
+    int LoadGlbMetadata(char* filename, size_t desLen, size_t srcLen);
+    int LoadMainPatternToGlbMap(IN char* deCompressedBuf, IN int srcLen);
+    int LoadSubPatternToGlbMap(IN char* deCompressedBuf, IN int srcLen);
+    int AddMainPatternToMap(char etag, int eid, int count, char* content);
+    int AddSubPatternToMap(int vid, char type, char* content);
+    int LoadOutliers(IN char* deCompressedBuf, int sLen, int lineCount);
+    int LoadVarOutliers(int filename, int lines, int srcLen);
+    // time index & column
+    int LoadTimeColumn();
+    int LoadTimeIndex();
+    BitMap* BuildTimeBitmap(long long start_ms, long long end_ms);
+    void ApplyTimeFilterToBitmaps(LISTBITMAPS& bitmaps, long long start_ms, long long end_ms);
 
 	int LoadcVars(int varname, int lineCnt, OUT char* vars, int varsLineLen, int flag=true);
 	int LoadcVarsByBitmap(int varname, BitMap* bitmap, OUT char* vars, int entryCnt, int varsLineLen, int flag=true);
@@ -127,6 +144,7 @@ private:
 	int GetDicIndexs(int varName, const char* regPattern, int queryType, OUT char* &dicQuerySegs);
 	int GetDicOffsetByEntry(SubPattern* subpat, int dicNo, int& dicLen);
 	int GetVarOutliers_BM(int varName, const char *queryStr, int queryType, BitMap* bitmap, BitMap* refBitmap);
+	int FilterNumericVar(int varfname, const char* expr, BitMap* bitmap);
 	int GetOutliers_MultiToken(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, BitMap* bitmap, bool beReverse=false);
 	int GetOutliers_SinglToken(char *arg, BitMap* bitmap, bool beReverse=false);
 	int GetOutliers_MultiToken_RefMap(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, BitMap* bitmap, BitMap* refbitmap, bool beReverse=false);
@@ -164,7 +182,7 @@ private:
 	int Materializ_Dic_Kmp(int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 
 public:
-	int IsConnect();
+    int IsConnect();
 
 	/*
 	** reference : establish access to logStore
@@ -183,8 +201,9 @@ public:
 	int GetVariablesByPatId(int patId, RegMatch *regResult);
 	int GetValuesByPatId_VarId(int patId, int varId, OUT char* vars);
 	int GetValuesByPatId_VarId_Reg(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT char* vars, BitMap* bitmap);
-	int SearchByReg(const char *regPattern);
-	int SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum);
+    int SearchByReg(const char *regPattern);
+    int SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum);
+    int SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out);
 
 };
 

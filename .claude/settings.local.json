@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(pkg-config:*)",
+      "Bash(make:*)",
+      "Bash(g++:*)",
+      "Bash(ls:*)",
+      "Bash(chmod:*)",
+      "Bash(./thulr_cmdline:*)",
+      "Bash(python3:*)",
+      "Bash(.\\thulr_cmdline:*)"
+    ],
+    "deny": []
+  }
+}

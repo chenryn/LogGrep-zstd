@@ -57,7 +57,8 @@ int CmdOperator::ReadFileToBuffByFread(FILE *pFile)
 char* CmdOperator::GetSubstr(const char* str, int start, int end)
 {
 	int len = end - start;
- 	char *stbuf = new char[len + 1]{'\0'};
+ 	char *stbuf = new char[len + 1];
+ 	memset(stbuf, '\0', len + 1);
  	strncpy(stbuf, str + start, len);
  	return stbuf;
 }

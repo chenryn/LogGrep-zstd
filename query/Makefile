@@ -11,8 +11,8 @@ EXE_DIR = ../output/
 RM	= rm -fr
 DEL_FILE	= rm -f
 
-CXX	= g++
-CPPFLAGS = -w -c -g -Wall -ggdb -lprofiler
+CXX	= g++ -arch x86_64
+CPPFLAGS = -std=c++11 -w -c -g -Wall -ggdb -arch x86_64
 #CPPFLAGS = -O2 -w -c -g
 LANGUAGE = -D	ENGLISH
 READLINE = -D	READLINE_LIBRARY
@@ -36,6 +36,8 @@ SRC_OBJECTS	=	$(FILE_DIR)BaseCmd.cpp \
 	$(FILE_DIR)SearchAlgorithm.cpp\
 	$(FILE_DIR)LogStore_API.cpp\
 	$(FILE_DIR)LogDispatcher.cpp\
+	$(FILE_DIR)var_alias.cpp\
+	$(FILE_DIR)StatisticsAPI.cpp\
 	$(REFER_DIR)Coffer.cpp\
 
 OBJECTS=	$(TEMP_DIR)BaseCmd.o \
@@ -49,6 +51,8 @@ OBJECTS=	$(TEMP_DIR)BaseCmd.o \
 	$(TEMP_DIR)SearchAlgorithm.o \
 	$(TEMP_DIR)LogStore_API.o\
 	$(TEMP_DIR)LogDispatcher.o\
+	$(TEMP_DIR)var_alias.o\
+	$(TEMP_DIR)StatisticsAPI.o\
 	$(TEMP_DIR)Coffer.o\
 		
 H_OBJECTS	=	$(FILE_DIR)BaseCmd.h \
@@ -69,22 +73,56 @@ H_OBJECTS	=	$(FILE_DIR)BaseCmd.h \
 ######-l pthread: pthread_create
 ######-l rt:realtime
 
-all: APP clean
+all: APP
 
 APP: $(BIN_OBJECT)
-	
+
 $(BIN_OBJECT):$(OBJECTS)
-	$(CXX) -o  $(BIN_OBJECT) $(OBJECTS) $(LIB) -l dl -lprofiler
+	$(CXX) -o  $(BIN_OBJECT) $(OBJECTS) $(LIB) -l dl
 	cp $(BIN_OBJECT) $(EXE_DIR)
-	
+
 $(OBJECTS):$(SRC_OBJECTS) $(H_OBJECTS)
 	$(CXX) $(CPPFLAGS) $(SRC_OBJECTS)
+
+server: thulr_server
+
+thulr_server: $(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
+	$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o $(TEMP_DIR)Coffer.o ServerMain.cpp Ingestor.cpp \
+	../compression/Encoder.cpp ../compression/LengthParser.cpp ../compression/template.cpp \
+	../compression/union.cpp ../compression/SubPattern.cpp ../compression/util.cpp \
+	../compression/sampler.cpp ../compression/TimeParser.cpp \
+	../compression/main.cpp
+	$(CXX) -std=c++11 -DLOGGREP_NO_MAIN -o thulr_server ServerMain.cpp Ingestor.cpp \
+		$(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
+		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)Coffer.o ../compression/Encoder.cpp ../compression/LengthParser.cpp \
+		../compression/template.cpp ../compression/union.cpp ../compression/SubPattern.cpp \
+		../compression/util.cpp ../compression/sampler.cpp \
+		../compression/TimeParser.cpp ../compression/main.cpp -I. -I../compression -I../zstd-dev/lib \
+		$(LIB) -l dl
+
+tests: test_ssh_simple test_ssh_statistics
+
+test_ssh_simple: $(OBJECTS) test_ssh_simple.cpp
+	$(CXX) -std=c++11 -o test_ssh_simple test_ssh_simple.cpp \
+		$(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)LogStore_API.o \
+		$(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o \
+		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o \
+		$(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)Coffer.o -I. -I../compression -I../zstd-dev/lib \
+		$(LIB) -l dl
+
+test_ssh_statistics: $(OBJECTS) test_ssh_statistics.cpp
+	$(CXX) -std=c++11 -o test_ssh_statistics test_ssh_statistics.cpp \
+		$(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)LogStore_API.o \
+		$(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o \
+		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o \
+		$(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)Coffer.o -I. -I../compression -I../zstd-dev/lib \
+		$(LIB) -l dl
 
 .PHONY:clean
 
 clean:
 	$(RM) $(OBJECTS)
 	
-
-
-

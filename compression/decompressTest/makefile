@@ -27,6 +27,6 @@ LIBPATH = -L ../LZMA
 start:$(OBJS)
 	$(cc) $(OBJS) $(LIB) -o $(EXEC) $(LIBPATH) $(LIBS)
 .cpp.o:
-	$(cc) -O0 -c -I$(LIBDIR) -std=c++11 -g -Wall -o $@ -c $^ 
+	$(cc) -O0 -I$(LIBDIR) -std=c++11 -g -Wall -c $< -o $@
 clean:
 	rm -rf $(OBJS) $(EXEC)

@@ -17,6 +17,7 @@
 #include <map>
 #include <cmath>
 #include <vector>
+#include <climits>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -30,6 +31,7 @@
 #include "Encoder.h"
 #include "timer.h"
 #include "Coffer.h"
+#include "TimeParser.h"
 
 
 using namespace std;
@@ -51,6 +53,25 @@ int LoadFileToMem(const char *varname, char **mbuf)
 	}
 	close(fd);
 	return len;
+}
+
+// 从内存缓冲区加载数据
+int LoadBufferToMem(const char *buffer, int buffer_len, char **mbuf)
+{
+	if (buffer == NULL || buffer_len <= 0)
+	{
+		return 0;
+	}
+	
+	// 分配内存并复制数据
+	*mbuf = (char *)malloc(buffer_len);
+	if (*mbuf == NULL)
+	{
+		return 0;
+	}
+	
+	memcpy(*mbuf, buffer, buffer_len);
+	return buffer_len;
 }
 
 //need to cache hot data?
@@ -147,6 +168,71 @@ int matchFile(string input_path, LengthParser* parser, string zip_mode, int * Ei
 	return failLine;
 }
 
+// 从内存缓冲区匹配数据
+int matchBuffer(char* mbuf, int len, LengthParser* parser, string zip_mode, int * Eid, int* failed_num, char** failed_log, map<int, VarArray*>& variables, int& nowLine)
+{
+    if(len <= 0 || mbuf == NULL)
+    {
+        return 0;
+    }
+    
+    SegTag segArray[MAXTOCKEN*100];
+    int segSize=0;
+    int segStart=0; int lineStart=0;
+    int failLine =0;
+    for (int i=0; i<len; i++)
+	{
+        if (mbuf[i] == '\n')
+		{
+            //判断最后是否还有字符串的遗留，也需要处理
+            if(i > segStart)
+            {
+                segArray[segSize].tag = 0;
+                segArray[segSize].startPos = segStart;
+                segArray[segSize].segLen=i-segStart;
+                segSize++;
+            }
+            //执行处理程序
+            int eid = parser -> SearchTemplate(mbuf, segArray, segSize, variables, true);
+			Eid[nowLine] = eid;
+            if(eid == -1)
+            {
+                // lineLen = lineEnd-lineStart;
+				failed_num[failLine] = nowLine;
+                failed_log[failLine] = (char*)malloc(sizeof(char) * (i-lineStart+1));
+                strncpy(failed_log[failLine], mbuf + lineStart, i-lineStart);
+                failed_log[failLine][i-lineStart] = '\0';
+			    //SysDebug("Failed log: %s\n", failed_log[failLine]);
+                failLine++;
+			}
+            nowLine++;
+            segSize=0;
+            segStart =i+1;
+            lineStart=i+1;
+		}
+        else if(strchr(delim,mbuf[i]))//记录分割符号
+        {
+            if(i > segStart)//delim前有字符串
+            {
+                segArray[segSize].tag = 0;
+                segArray[segSize].startPos = segStart;
+                segArray[segSize].segLen=i-segStart;
+                segSize++;
+
+            }
+            //记录分隔符本身
+            segArray[segSize].tag = mbuf[i];
+            segArray[segSize].segLen=1;
+            segArray[segSize].startPos = i;
+            segStart =i+1;
+            segSize++;
+        }
+	}
+	//SysDebug("Failed line: %d\n", failLine);
+    if(zip_mode != "Z") cout << "Failed rate: " << (double)failLine / nowLine << endl;
+    return failLine;
+}
+
 
 bool outputVar(string fileName, vector<string>* temp){
 	FILE* fo = fopen(fileName.c_str(), "w");
@@ -185,6 +271,13 @@ bool outputEntry(string fileName, int* entry, int maxIdx, int size){
 }
 
 /*
+从内存缓冲区处理数据
+buffer: 内存缓冲区
+buffer_len: 缓冲区长度
+*/
+void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mode, string zip_mode, int compression_level, double threashold);
+
+/*
 主处理函数入口
 ./Input A.log -> A.zip
 
@@ -202,6 +295,29 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
         SysWarning("Read file failed!\n");
         return;
     }
+    
+    // 调用通用处理函数
+    proc_buffer(mbuf, len, output_path, cp_mode, zip_mode, compression_level, threashold);
+}
+
+/*
+从内存缓冲区处理数据
+buffer: 内存缓冲区
+buffer_len: 缓冲区长度
+*/
+void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mode, string zip_mode, int compression_level, double threashold){
+    
+    timeval stime_s = ___StatTime_Start();    
+	
+    bool dict = true;
+    bool sub = true;
+    
+    char* mbuf = buffer;
+    int len = buffer_len;
+    if (len <= 0 || mbuf == NULL){
+        SysWarning("Invalid buffer data!\n");
+        return;
+    }
     SegTag segArray[MAXTOCKEN * 100];
     int segSize = 0;
     int segStart = 0, lineStart = 0;
@@ -211,6 +327,15 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
     int nowLine = 0, nowSample = 0;
     bool sampled = false;
     LengthParser parser(threashold);
+
+    // time column and fixed-size segment accounting
+    vector<long long> time_values;
+    time_values.reserve(100000);
+    vector<int> seg_line_starts; vector<int> seg_line_ends;
+    vector<long long> seg_min_ts; vector<long long> seg_max_ts;
+    int current_segment_bytes = 0;
+    int current_segment_min_line = 0;
+    long long cur_seg_min = LLONG_MAX; long long cur_seg_max = LLONG_MIN;
 
     for (int i = 0; i < len; i++){
         if(segSize == MAXTOCKEN*100 - 1){
@@ -234,12 +359,36 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
             }else{
                 sampled = false;
             }
+            // extract timestamp for this line
+            int line_len = i - lineStart;
+            long long ts_ms = 0;
+            auto span = detect_timestamp_span(mbuf + lineStart, line_len);
+            if(span.first >= 0){
+                if(!parse_timestamp_ms(mbuf + lineStart + span.first, span.second, ts_ms)){
+                    ts_ms = (long long)time(NULL) * 1000LL;
+                }
+            } else {
+                ts_ms = (long long)time(NULL) * 1000LL;
+            }
+            time_values.push_back(ts_ms);
+            current_segment_bytes += (i - lineStart + 1);
+            if(ts_ms < cur_seg_min) cur_seg_min = ts_ms;
+            if(ts_ms > cur_seg_max) cur_seg_max = ts_ms;
             nowLine++;
             segSize = 0;
             segStart = i + 1;
             lineStart = i + 1;
             if(i - lineStart > MAX_VALUE_LEN){
                 SysWarning("[WARNING] line length out of bound: %d\n", i - lineStart);
+            }
+            // finalize a segment when exceeding threshold bytes
+            if(current_segment_bytes >= DEFAULT_SEGMENT_BYTES){
+                seg_line_starts.push_back(current_segment_min_line);
+                seg_line_ends.push_back(nowLine - 1);
+                seg_min_ts.push_back(cur_seg_min == LLONG_MAX ? (long long)time(NULL)*1000LL : cur_seg_min);
+                seg_max_ts.push_back(cur_seg_max == LLONG_MIN ? (long long)time(NULL)*1000LL : cur_seg_max);
+                current_segment_min_line = nowLine;
+                current_segment_bytes = 0; cur_seg_min = LLONG_MAX; cur_seg_max = LLONG_MIN;
             }
         }else if(sampled && strchr(delim, mbuf[i])){
             if (i > segStart){
@@ -286,7 +435,7 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
 	char* failed_log[MAXLOG * 2];
 	
     int nowline = 0;
-    int failLine = matchFile(input_path, &parser, zip_mode, Eid, failed_num, failed_log, variable_mapping, nowline);
+    int failLine = matchBuffer(mbuf, len, &parser, zip_mode, Eid, failed_num, failed_log, variable_mapping, nowline);
     
 
     double mtime = ___StatTime_End(mtime_s);
@@ -501,11 +650,21 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
     
     timeval ctime_s = ___StatTime_Start();
     if(zip_mode != "Z") cout << "start compression" << endl;
-    encoder -> serializeSubpattern(output_path, SUBPATTERN, SUBCOUNT);	
+    encoder -> serializeSubpattern(output_path, SUBPATTERN, SUBCOUNT);
+    // finalize last segment and write time/index
+    if(current_segment_min_line < nowLine){
+        seg_line_starts.push_back(current_segment_min_line);
+        seg_line_ends.push_back(nowLine - 1);
+        seg_min_ts.push_back(cur_seg_min == LLONG_MAX ? (long long)time(NULL)*1000LL : cur_seg_min);
+        seg_max_ts.push_back(cur_seg_max == LLONG_MIN ? (long long)time(NULL)*1000LL : cur_seg_max);
+    }
+    encoder -> serializeTimeColumn(time_values);
+    encoder -> serializeTimeIndex(seg_line_starts, seg_line_ends, seg_min_ts, seg_max_ts);
     
     //int output_type = (zip_mode == "O") ? 1: 0;
     printf("start output\n");
     encoder -> output(output_path, 0);
+    
     double ctime = ___StatTime_End(ctime_s);
 	
     free(Eid);
@@ -518,6 +677,31 @@ void proc(string input_path, string output_path, string cp_mode, string zip_mode
 }
 
 // ./THULR -I /apsarapangu/disk9/LogSeg/Android/0.log -O /apsarapangu/disk9/PillBox_test/Android.zip
+// 函数声明
+void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mode, string zip_mode, int compression_level, double threashold);
+
+// 提供给Python调用的接口函数
+extern "C" {
+    int compress_from_memory(const char* buffer, int buffer_len, const char* output_path) {
+        if (buffer == NULL || buffer_len <= 0 || output_path == NULL) {
+            return -1;
+        }
+        string cp_mode = "Zstd";
+        string zip_mode = "O";
+        int compression_level = 1;
+        double threashold = 0.5;
+        char* data_copy = (char*)malloc(buffer_len);
+        if (data_copy == NULL) {
+            return -2;
+        }
+        memcpy(data_copy, buffer, buffer_len);
+        proc_buffer(data_copy, buffer_len, string(output_path), cp_mode, zip_mode, compression_level, threashold);
+        free(data_copy);
+        return 0;
+    }
+}
+
+#ifndef LOGGREP_NO_MAIN
 int main(int argc, char *argv[]){
 //TODO:
 //1. Fix parser bugs
@@ -526,12 +710,13 @@ int main(int argc, char *argv[]){
 
 	// clock_t start = clock();
 	int o;
-	const char *optstring = "HhI:O:C:Z:L:";
+	const char *optstring = "HhI:O:C:Z:L:B";
 	srand(4);
 	//Input Content
 	string input_path; string output_path;
     string cp_mode, zip_mode;
     int compression_level = 1;
+    bool from_stdin = false;
     //Input A.log -> A.zip
 	while ((o = getopt(argc, argv, optstring)) != -1)
 	{
@@ -558,6 +743,10 @@ int main(int argc, char *argv[]){
             compression_level = atoi(optarg);
             printf("Compression level: %d\n", compression_level);
             break;
+        case 'B':
+            from_stdin = true;
+            printf("Reading from standard input\n");
+            break;
         case 'h':
 		case 'H':
 			printf("-I input path\n");
@@ -566,6 +755,7 @@ int main(int argc, char *argv[]){
 			printf("-C compression methods(Zstd or Lzma)\n");
 			printf("-L compression_level\n");
 			printf("-Z compression_mode\n");
+			printf("-B read from standard input\n");
             return 0;
 			break;
 		case '?':
@@ -577,8 +767,8 @@ int main(int argc, char *argv[]){
 	}
 	
 	//Basic input check
-	if (input_path == ""){
-		printf("error : No input file\n");
+	if (input_path == "" && !from_stdin){
+		printf("error : No input file and not reading from stdin\n");
 		return -1;
 	}
 	
@@ -595,5 +785,45 @@ int main(int argc, char *argv[]){
     }
     double threashold = 0.5;
     
-    proc(input_path, output_path, cp_mode, zip_mode, compression_level, threashold); 
-} 
+    if (from_stdin) {
+        // 从标准输入读取数据
+        const int BUFFER_SIZE = 1024 * 1024; // 1MB 初始缓冲区
+        char* buffer = (char*)malloc(BUFFER_SIZE);
+        int total_size = 0;
+        int buffer_capacity = BUFFER_SIZE;
+        
+        if (buffer == NULL) {
+            printf("Failed to allocate memory for stdin buffer\n");
+            return -1;
+        }
+        
+        // 从标准输入读取数据
+        int bytes_read;
+        while ((bytes_read = read(STDIN_FILENO, buffer + total_size, buffer_capacity - total_size)) > 0) {
+            total_size += bytes_read;
+            
+            // 如果缓冲区快满了，扩大缓冲区
+            if (total_size > buffer_capacity * 0.8) {
+                buffer_capacity *= 2;
+                buffer = (char*)realloc(buffer, buffer_capacity);
+                if (buffer == NULL) {
+                    printf("Failed to reallocate memory for stdin buffer\n");
+                    return -1;
+                }
+            }
+        }
+        
+        if (total_size > 0) {
+            // 处理从标准输入读取的数据
+            proc_buffer(buffer, total_size, output_path, cp_mode, zip_mode, compression_level, threashold);
+        } else {
+            printf("No data read from standard input\n");
+        }
+        
+        free(buffer);
+    } else {
+        // 从文件读取数据
+        proc(input_path, output_path, cp_mode, zip_mode, compression_level, threashold);
+    }
+}
+#endif

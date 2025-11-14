@@ -167,13 +167,19 @@ int LogDispatcher::CalRunningTime()
 
 int LogDispatcher::ResetRunningTime()
 {
-	m_runt.LoadDeComLogTime = 0;
-	m_runt.SearchTotalTime = 0;
+    m_runt.LoadDeComLogTime = 0;
+    m_runt.SearchTotalTime = 0;
 	//m_runt.SearchPatternTime = 0;
 	//m_runt.SearchOutlierTime = 0;
 	m_runt.MaterializFulTime = 0;
 	m_runt.MaterializAlgTime = 0;
 	//runt.SearchOutliersNum = 0;
+}
+
+int LogDispatcher::GetRunningStatus(OUT RunningStatus& out)
+{
+    out = m_runt;
+    return 0;
 }
 
 //////////////////////SearchByWildcard///////////////////////////////
@@ -207,6 +213,36 @@ int LogDispatcher::SearchByWildcard_Seq(char *args[MAX_CMD_ARG_COUNT], int argCo
 		//printf("tt: %d %d\n", totalMatNum, matnum);
 	}
 	CalRunningTime();
+}
+
+
+int LogDispatcher::SearchByWildcard_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out)
+{
+    int totalMatNum = matNum;
+    bool first = true;
+    json_out.clear();
+    json_out.append("[");
+    for (int itor = 0; itor < m_fileCnt; itor++)
+    {
+        LogStoreApi* logStore = m_logStores[itor];
+        std::string part;
+        int got = logStore->SearchByWildcard_Token_JSON(args, argCount, totalMatNum, part);
+        if(got > 0)
+        {
+            if(part.size() >= 2)
+            {
+                if(!first) json_out.append(",");
+                first = false;
+                json_out.append(part.substr(1, part.size()-2));
+            }
+        }
+        totalMatNum -= got;
+        if(totalMatNum <= 0) break;
+    }
+    json_out.append("]");
+    CalRunningTime();
+    ResetRunningTime();
+    return matNum - totalMatNum;
 }
 
 

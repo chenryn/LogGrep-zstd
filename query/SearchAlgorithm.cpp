@@ -1,4 +1,5 @@
 #include "SearchAlgorithm.h"
+#include <regex.h>
 
 #include <sys/time.h>
 
@@ -1497,7 +1498,7 @@ int QueryInStrArray_CReg(char** targetStr, int lineCount, const char *queryStr, 
 		for(int i=0;i<lineCount;i++)
 		{
 			matchResult = regexec(&reg, targetStr[i], nmatch, &pm, REG_NOTBOL);
-			if(matchResult == REG_NOERROR)
+			if(matchResult == 0)
 			{
 				bitmap->Union(i);
 			}
@@ -1510,7 +1511,7 @@ int QueryInStrArray_CReg(char** targetStr, int lineCount, const char *queryStr, 
 		for(int i=0;i< bitmapSize;i++)
 		{
 			matchResult = regexec(&reg, targetStr[bitmap->GetIndex(i)], nmatch, &pm, REG_NOTBOL);
-			if(matchResult == REG_NOERROR)
+			if(matchResult == 0)
 			{
 				bitmap->Inset(bitmap->GetIndex(i));
 			}
@@ -1543,7 +1544,7 @@ int QueryInStrArray_CReg_RefMap(char** targetStr, int lineCount, const char *que
 	for(int i=0;i< bitmapSize;i++)
 	{
 		matchResult = regexec(&reg, targetStr[refBitmap->GetIndex(i)], nmatch, &pm, REG_NOTBOL);
-		if(matchResult == REG_NOERROR)
+		if(matchResult == 0)
 		{
 			bitmap->Union(refBitmap->GetIndex(i));
 		}
@@ -1572,7 +1573,7 @@ int QueryInStrArray_CReg_Reverse(char** targetStr, int lineCount, const char *qu
 		for(int i=0;i<lineCount;i++)
 		{
 			matchResult = regexec(&reg, targetStr[i], nmatch, &pm, REG_NOTBOL);
-			if(matchResult != REG_NOERROR)
+			if(matchResult != 0)
 			{
 				bitmap->Union(i);
 			}
@@ -1585,7 +1586,7 @@ int QueryInStrArray_CReg_Reverse(char** targetStr, int lineCount, const char *qu
 		for(int i=0;i< bitmapSize;i++)
 		{
 			matchResult = regexec(&reg, targetStr[bitmap->GetIndex(i)], nmatch, &pm, REG_NOTBOL);
-			if(matchResult != REG_NOERROR)
+			if(matchResult != 0)
 			{
 				bitmap->Inset(bitmap->GetIndex(i));
 			}
@@ -1618,7 +1619,7 @@ int QueryInStrArray_CReg_Reverse_RefMap(char** targetStr, int lineCount, const c
 	for(int i=0;i< bitmapSize;i++)
 	{
 		matchResult = regexec(&reg, targetStr[refBitmap->GetIndex(i)], nmatch, &pm, REG_NOTBOL);
-		if(matchResult != REG_NOERROR)
+		if(matchResult != 0)
 		{
 			bitmap->Union(refBitmap->GetIndex(i));
 		}
@@ -1640,7 +1641,7 @@ int QueryInStr_CReg(const char* text, const char *regPattern)
 		return -1;
 	}
 	int	matchResult = regexec(&reg, text, nmatch, &pm, REG_NOTBOL);
-	if(matchResult == REG_NOERROR)
+	if(matchResult == 0)
 	{
 		ret = 1;
 	}

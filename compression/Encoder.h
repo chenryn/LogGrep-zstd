@@ -37,6 +37,13 @@ class Encoder{
         
         void serializeSubpattern(string zip_path, string SUBPATTERN, int SUBCOUNT);
 
+        // Time-related
+        void serializeTimeColumn(const std::vector<long long>& times);
+        void serializeTimeIndex(const std::vector<int>& seg_starts,
+                                const std::vector<int>& seg_ends,
+                                const std::vector<long long>& seg_min,
+                                const std::vector<long long>& seg_max);
+
         //Output
         void output(string zip_path, int typ);
 

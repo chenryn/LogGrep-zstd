@@ -19,6 +19,9 @@
 #define TYPE_TEMPLATE 5
 #define TYPE_VARIABLELIST 6
 #define TYPE_OUTLIER 7
+// time-related coffers
+#define TYPE_TIME_COL 8
+#define TYPE_TIME_INDEX 9
 
 #define MAXLOG 100000 //The max number of log entry
 #define MAX_VALUE_LEN  10000
@@ -33,12 +36,16 @@
 #define MAXCOL 256 //The number of variable(int, string)
 #define MAXUNION 1024
 #define MAXCOMPRESS 16*1024*1024
+#define MAX_SAFE_DECOMPRESS_SIZE 100*1024*1024 // 最大安全解压缩大小限制(100MB)
 
 #define LINE_LENGTH 10000000 //The length of log read buffer
 #define MAXSTRLEN 1024 //The max number of char in string parameter
 #define BUFSIZE 1024 //String reading buffer
 #define TEMPLATE_THRESHOLD 64
 #define MAXBUFFER 100000000
+
+// default fixed-size segment bytes for initial implementation (align to newline)
+#define DEFAULT_SEGMENT_BYTES (64*1024*1024)
 
 #define SysDebug //printf
 #define SysWarning printf

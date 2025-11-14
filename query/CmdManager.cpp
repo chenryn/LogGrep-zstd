@@ -1,5 +1,6 @@
 #include "CmdManager.h"
 #include <iostream>
+#include "var_alias.h"
 // #include <pthread.h>
 // #include <signal.h>
 
@@ -97,17 +98,24 @@ int CmdManager::AnalysisCmd(char *inputCharArray, char *args[MAX_CMD_ARG_COUNT])
 
 int CmdManager::AnalysisCmd_ForTest(char* path, char *inputCharArray, char *args[MAX_CMD_ARG_COUNT])
 {
-	int argCount = 0;
-	//do if inputCharArray is not null
+    int argCount = 0;
+    //do if inputCharArray is not null
     if (inputCharArray && *inputCharArray)
-	{
-        argCount = GetCmdArgs(inputCharArray, TOKEN, args);
+    {
+        char* colon = strchr(inputCharArray, ':');
+        std::string rewritten;
+        if(colon && colon != inputCharArray)
+        {
+            rewritten = std::string(colon + 1);
+        }
+        const char* feed = rewritten.empty() ? inputCharArray : rewritten.c_str();
+        argCount = GetCmdArgs((char*)feed, TOKEN, args);
         if(argCount > 0)
         {
             m_invoker->DoInvokeCmd_ForTest(path, args, argCount);
         }
-	}
-	return 0;
+    }
+    return 0;
 }
 
 int CmdManager::DoCmdAnalysis(char* path, char *m_lineRead)

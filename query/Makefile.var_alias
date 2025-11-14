@@ -1,0 +1,38 @@
+# 变量别名管理工具的Makefile
+
+CC = g++
+CFLAGS = -Wall -g -std=c++17
+
+# 包含目录
+INCLUDES = -I../compression
+
+# 目标文件
+TARGET = var_alias_tool
+
+# 源文件
+SRCS = var_alias_tool.cpp var_alias.cpp
+
+# 默认目标
+all: $(TARGET)
+
+# 编译规则
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
+# 清理规则
+clean:
+	rm -f $(TARGET) *.o
+
+# 安装规则
+install: $(TARGET)
+	cp $(TARGET) /usr/local/bin/
+
+# 帮助信息
+help:
+	@echo "变量别名管理工具 Makefile"
+	@echo "使用方法:"
+	@echo "  make       - 编译变量别名管理工具"
+	@echo "  make clean - 清理编译产物"
+	@echo "  make install - 安装到系统目录"
+
+.PHONY: all clean install help

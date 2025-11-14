@@ -102,3 +102,46 @@ Then query compressed logs.
 All testing query for large test can be found at ./query4largetest.txt. For example, to run query on Hadoop logs, you can use command as follow:
 
 ``./thulr_cmdline ../LogHub_Seg_zip/Hadoop "ERROR and RECEIVED SIGNAL 15: SIGTERM and 2015-09-23"``
+
+# 新增功能（中文）
+- 字段别名查询与数值过滤
+
+## 字段别名系统
+- 配置文件优先级：优先读取压缩文件同目录下的`<文件名>.var_alias`，若不存在则回退到目录级`var_alias.conf`
+- 支持两种格式：
+  - 变量ID→别名：`E<模板>_V<变量>.<类型>=<别名>`（例如：`1_1.1=src.ip`）
+  - 别名→多变量：`<别名>: E<模板>_V<变量>, ...`（例如：`Host: E7_V4, E6_V4, E30_V3`）
+
+## 查询语法
+- 别名查询：`./thulr_cmdline <压缩目录> "<别名>:<值>[|<选项>]"`
+- 选项：
+  - `strict`：仅在别名映射的变量位执行过滤；不回落到主模板常量匹配与异常匹配
+  - `ci`：回落到主模板常量匹配时大小写不敏感（case-insensitive）
+
+## 数值过滤（仅对VAR类型变量位生效）
+- 支持操作符：`==`, `!=`, `>`, `>=`, `<`, `<=`
+- 支持范围写法：`a..b`（闭区间），例如`1024..65535`
+- 示例：
+  - `Port:22`（等价于`Port:==22`）
+  - `Port:>=1024`（数值大于等于）
+  - `Port:1024..65535`（范围过滤）
+  - `Port:22|strict`（仅变量位过滤，不回落常量）
+
+## 常量匹配回退
+- 当别名映射的变量位没有命中且未指定`strict`时，系统会回落到主模板常量匹配并物化输出
+- 指定`ci`时，常量匹配大小写不敏感
+
+## 示例
+- `./thulr_cmdline ../lib_output_zip/Ssh "Host:LabSZ"`
+- `./thulr_cmdline ../lib_output_zip/Ssh "Host:LabSZ|ci"`
+- `./thulr_cmdline ../lib_output_zip/Ssh "Port:22"`
+- `./thulr_cmdline ../lib_output_zip/Ssh "Port:>=1024"`
+- `./thulr_cmdline ../lib_output_zip/Ssh "Port:1024..65535|strict"`
+
+## 兼容性提示
+- 某些数据集（例如示例Ssh）中，`Host`更像模板常量而非变量位；在此情况下`|strict`可能无命中，建议使用默认或`|ci`以获得常量匹配效果
+
+## 变更摘要
+- 查询入口支持`别名:值`语法与`strict`/`ci`选项
+- 对VAR变量位新增数值比较与范围过滤
+- 别名解析兼容两种配置格式，并支持一对多映射

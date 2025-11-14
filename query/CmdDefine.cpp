@@ -7,7 +7,8 @@ int Split_NoDelim(IN char *source, IN char *sep, OUT char *pArray[MAX_CMD_PARAMS
 	while (pParam && nParamCount < MAX_CMD_PARAMS_COUNT)
 	{
 		int nTempLen = strlen(pParam);
-		pArray[nParamCount] = new char[nTempLen + 1]{'\0'};
+		pArray[nParamCount] = new char[nTempLen + 1];
+		memset(pArray[nParamCount], '\0', nTempLen + 1);
 		//trim space and tab at both begin and end
 		memcpy(pArray[nParamCount], pParam, nTempLen);
 		nParamCount++;
@@ -27,7 +28,8 @@ int Split(IN char *source, IN char *sep, OUT char *pArray[MAX_CMD_PARAMS_COUNT])
 		{
 			int nTempLen = strlen(pParam);
 			
-			pArray[nParamCount] = new char[nTempLen + 1]{'\0'};
+			pArray[nParamCount] = new char[nTempLen + 1];
+			memset(pArray[nParamCount], '\0', nTempLen + 1);
 			//trim space and tab at both begin and end
 			//int nDesLen = Trim(pParam, pArray[nParamCount]);
 			memcpy(pArray[nParamCount], pParam, nTempLen);
@@ -35,7 +37,8 @@ int Split(IN char *source, IN char *sep, OUT char *pArray[MAX_CMD_PARAMS_COUNT])
 		}
 		if(return_value != 0)
 		{
-			pArray[nParamCount] = new char[2]{'\0'};
+			pArray[nParamCount] = new char[2];
+			memset(pArray[nParamCount], '\0', 2);
 			pArray[nParamCount][0] = char(return_value);
 			nParamCount++;
 		}
@@ -109,7 +112,8 @@ int Trim(IN char *sou, OUT char *des)
 	}
 	if(des == NULL)
 	{
-		des = new char[strlen(sou) + 1]{'\0'};
+		des = new char[strlen(sou) + 1];
+		memset(des, '\0', strlen(sou) + 1);
 	}
 	nDesLen = (nEndPos - nBeginPos + 1);
 	strncpy(des, sou + nBeginPos, nDesLen + 1);

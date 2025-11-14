@@ -1,0 +1,24 @@
+CC = g++
+CFLAGS = -g -Wall -std=c++11
+INCLUDES = -I. -I../compression
+LIBS = -lzstd
+
+# JSON query tool
+thulr_cmdline_json: thulr_cmdline_json.cpp LogStore_API.o LogStructure.o SearchAlgorithm.o
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LIBS)
+
+# Object files from existing build
+LogStore_API.o: LogStore_API.cpp LogStore_API.h LogStructure.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c $<
+
+LogStructure.o: LogStructure.cpp LogStructure.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c $<
+
+SearchAlgorithm.o: SearchAlgorithm.cpp SearchAlgorithm.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c $<
+
+# Clean
+json-clean:
+	rm -f thulr_cmdline_json
+
+.PHONY: json-clean
