@@ -22,6 +22,7 @@
 // time-related coffers
 #define TYPE_TIME_COL 8
 #define TYPE_TIME_INDEX 9
+#define TYPE_BLOOM 10
 
 #define MAXLOG 100000 //The max number of log entry
 #define MAX_VALUE_LEN  10000

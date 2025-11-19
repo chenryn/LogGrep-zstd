@@ -35,6 +35,16 @@
 
 
 using namespace std;
+static unsigned int stable_id_from_string(const std::string& s){
+    unsigned int hash = 2166136261u;
+    for(unsigned char c : s){
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    hash &= 0xFFFFu;
+    if(hash == 0) hash = 1;
+    return hash;
+}
 
 const char* delim = " \t:=,";
 
@@ -414,7 +424,8 @@ void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mod
         vector<templateNode*>* nowPool = pool.second;
         for(auto &temp: *nowPool){
             for(int i = 0; i < temp->varLength; i++){
-                int nowTag = ((temp->Eid)<<POS_TEMPLATE) | (i<<POS_VAR);
+                unsigned int sid = stable_id_from_string(temp->output());
+                int nowTag = ((sid)<<POS_TEMPLATE) | (i<<POS_VAR);
                 variable_mapping[nowTag] = new VarArray(nowTag, parser.STC[temp->Eid] * expendTime);
             }
         }

@@ -110,6 +110,14 @@ void Encoder::serializeVar(string filename, char* globuf, VarArray* var, int max
     int tot = length * (maxLen+1);
     char* temp = new char[tot + 5];
     int nowPtr = 0;
+    const int KMV_K = 1024;
+    std::vector<unsigned long long> kmv;
+    kmv.reserve(KMV_K);
+    auto hash64 = [](const char* s, int len)->unsigned long long{
+        unsigned long long h = 1469598103934665603ULL;
+        for(int i=0;i<len;i++){ h ^= (unsigned long long)(unsigned char)s[i]; h *= 1099511628211ULL; }
+        return h;
+    };
     for(int i=0; i< length; i++)
     {
         int varLen = var->len[i];
@@ -118,11 +126,64 @@ void Encoder::serializeVar(string filename, char* globuf, VarArray* var, int max
         padding(filename, temp, nowPtr, padSize, 0);
         nowPtr += padSize;
         strncpy(temp + nowPtr, globuf + var->startPos[i], varLen);
+        unsigned long long hv = hash64(globuf + var->startPos[i], varLen);
+        if((int)kmv.size() < KMV_K){ kmv.push_back(hv); }
+        else {
+            int idxMax = 0; unsigned long long vmax = kmv[0];
+            for(int j=1;j<KMV_K;j++){ if(kmv[j] > vmax){ vmax = kmv[j]; idxMax = j; } }
+            if(hv < vmax){ kmv[idxMax] = hv; }
+        }
         nowPtr += varLen;
     }
 
     Coffer* nCoffer = new Coffer(filename, temp, nowPtr, length, 5, maxLen);
     data.push_back(nCoffer);
+
+    if(length >= 10000){
+        if(kmv.empty()) return;
+        unsigned long long vmax = kmv[0];
+        for(size_t j=1;j<kmv.size();j++){ if(kmv[j] > vmax) vmax = kmv[j]; }
+        double Uk = (double)vmax / (double)0xFFFFFFFFFFFFFFFFULL;
+        if(Uk <= 0.) Uk = 1e-12;
+        double Dhat = ((double)kmv.size() - 1.0) / Uk;
+        if(Dhat < 1.0) Dhat = 1.0;
+        double r = Dhat / (double)length;
+        if(r >= 0.7){
+            size_t var_bytes = (size_t)nowPtr;
+            size_t budget = (size_t)(var_bytes * 0.01);
+            if(budget < 1024) budget = 1024;
+            if(budget > (size_t)(2*1024*1024)) budget = (size_t)(2*1024*1024);
+            double bpi = (double)(budget * 8) / Dhat;
+            int k = (int)(bpi * 0.69314718056);
+            if(k < 1) k = 1; if(k > 16) k = 16;
+            size_t m_bits = budget * 8;
+            std::vector<unsigned char> bloom;
+            bloom.resize(budget + 24);
+            unsigned long long* hdr_ptr = (unsigned long long*)&bloom[0];
+            hdr_ptr[0] = (unsigned long long)m_bits;
+            unsigned int* kptr = (unsigned int*)&bloom[8];
+            *kptr = (unsigned int)k;
+            unsigned long long* seedptr = (unsigned long long*)&bloom[12];
+            *seedptr = 0x9E3779B97F4A7C15ULL;
+            auto mix = [](unsigned long long x){ x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; x ^= x >> 31; return x; };
+            auto setbit = [&](size_t bit){ size_t byte = bit >> 3; int off = bit & 7; bloom[24 + byte] |= (unsigned char)(1u << off); };
+            for(int i=0;i<length;i++){
+                int varLen = var->len[i];
+                unsigned long long h1 = hash64(globuf + var->startPos[i], varLen);
+                unsigned long long h2 = mix(h1);
+                for(int t=0;t<k;t++){
+                    unsigned long long hv = h1 + t * h2;
+                    size_t bit = (size_t)(hv % m_bits);
+                    setbit(bit);
+                }
+            }
+            int id = atoi(filename.c_str());
+            int base = (id & (~0xF));
+            int bloomId = base | (TYPE_BLOOM << POS_TYPE);
+            Coffer* bCoffer = new Coffer(to_string(bloomId), (char*)&bloom[0], (int)bloom.size(), 1, 1, -4);
+            data.push_back(bCoffer);
+        }
+    }
 }
 
 void Encoder::serializeEntry(string filename, int* entry, int maxEntry, int total){

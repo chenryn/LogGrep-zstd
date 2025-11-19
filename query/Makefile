@@ -18,6 +18,12 @@ LANGUAGE = -D	ENGLISH
 READLINE = -D	READLINE_LIBRARY
 ##LANGUAGE = -D	CHINESE
 
+PEGTL_INC =
+PEGTL_FLAGS =
+ifneq ($(PEGTL_INC),)
+PEGTL_FLAGS = -DUSE_PEGTL -I$(PEGTL_INC)
+endif
+
 BIN_OBJECT	= thulr_cmdline
 #LZMALIB_OBJECT = liblzma.a
 
@@ -39,6 +45,7 @@ SRC_OBJECTS	=	$(FILE_DIR)BaseCmd.cpp \
 	$(FILE_DIR)var_alias.cpp\
 	$(FILE_DIR)StatisticsAPI.cpp\
 	$(REFER_DIR)Coffer.cpp\
+	$(REFER_DIR)TimeParser.cpp\
 
 OBJECTS=	$(TEMP_DIR)BaseCmd.o \
 	$(TEMP_DIR)CmdDefine.o \
@@ -54,6 +61,7 @@ OBJECTS=	$(TEMP_DIR)BaseCmd.o \
 	$(TEMP_DIR)var_alias.o\
 	$(TEMP_DIR)StatisticsAPI.o\
 	$(TEMP_DIR)Coffer.o\
+	$(TEMP_DIR)TimeParser.o\
 		
 H_OBJECTS	=	$(FILE_DIR)BaseCmd.h \
 	$(FILE_DIR)CmdDefine.h \
@@ -87,14 +95,28 @@ $(OBJECTS):$(SRC_OBJECTS) $(H_OBJECTS)
 server: thulr_server
 
 thulr_server: $(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
-	$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o $(TEMP_DIR)Coffer.o ServerMain.cpp Ingestor.cpp \
+	$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o $(TEMP_DIR)Coffer.o ServerMain.cpp Ingestor.cpp \
+	../compression/Encoder.cpp ../compression/LengthParser.cpp ../compression/template.cpp \
+	../compression/union.cpp ../compression/SubPattern.cpp ../compression/util.cpp \
+	../compression/sampler.cpp ../compression/TimeParser.cpp
+	$(CXX) -std=c++11 $(PEGTL_FLAGS) -DLOGGREP_NO_MAIN -DLOGGREP_LOCAL_STUB -o thulr_server ServerMain.cpp SPLParser.cpp Ingestor.cpp \
+		$(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
+		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)Coffer.o ../compression/Encoder.cpp ../compression/LengthParser.cpp \
+		../compression/template.cpp ../compression/union.cpp ../compression/SubPattern.cpp \
+		../compression/util.cpp ../compression/sampler.cpp \
+		../compression/TimeParser.cpp -I. -I../compression -I../zstd-dev/lib \
+		$(LIB) -l dl
+
+server_real: $(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
+	$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o $(TEMP_DIR)Coffer.o ServerMain.cpp Ingestor.cpp \
 	../compression/Encoder.cpp ../compression/LengthParser.cpp ../compression/template.cpp \
 	../compression/union.cpp ../compression/SubPattern.cpp ../compression/util.cpp \
 	../compression/sampler.cpp ../compression/TimeParser.cpp \
 	../compression/main.cpp
-	$(CXX) -std=c++11 -DLOGGREP_NO_MAIN -o thulr_server ServerMain.cpp Ingestor.cpp \
+	$(CXX) -std=c++11 $(PEGTL_FLAGS) -DLOGGREP_NO_MAIN -o thulr_server_real ServerMain.cpp SPLParser.cpp Ingestor.cpp \
 		$(TEMP_DIR)LogStructure.o $(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)LogStore_API.o \
-		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)LogDispatcher.o $(TEMP_DIR)StatisticsAPI.o $(TEMP_DIR)var_alias.o $(TEMP_DIR)CmdDefine.o \
 		$(TEMP_DIR)Coffer.o ../compression/Encoder.cpp ../compression/LengthParser.cpp \
 		../compression/template.cpp ../compression/union.cpp ../compression/SubPattern.cpp \
 		../compression/util.cpp ../compression/sampler.cpp \
@@ -121,8 +143,18 @@ test_ssh_statistics: $(OBJECTS) test_ssh_statistics.cpp
 		$(TEMP_DIR)Coffer.o -I. -I../compression -I../zstd-dev/lib \
 		$(LIB) -l dl
 
+test_logic_axb: $(OBJECTS) test_logic_axb.cpp
+	$(CXX) -std=c++11 -o test_logic_axb test_logic_axb.cpp \
+		$(TEMP_DIR)LogStore_API.o $(TEMP_DIR)LogStructure.o \
+		$(TEMP_DIR)SearchAlgorithm.o $(TEMP_DIR)CmdDefine.o \
+		$(TEMP_DIR)var_alias.o $(TEMP_DIR)Coffer.o \
+		-I. -I../compression -I../zstd-dev/lib $(LIB) -l dl
+
 .PHONY:clean
 
 clean:
 	$(RM) $(OBJECTS)
+	
+test_splparser: SPLParser.cpp SPLParser.h test_splparser.cpp
+	$(CXX) -std=c++11 $(PEGTL_FLAGS) -o test_splparser test_splparser.cpp SPLParser.cpp
 	

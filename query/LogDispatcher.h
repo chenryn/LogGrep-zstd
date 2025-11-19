@@ -39,6 +39,11 @@ public:
     static void * SearchByWildcard_pthread(void *ptr);
     int GetRunningStatus(OUT RunningStatus& out);
     int SearchByWildcard_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out);
+    int CountByWildcard(char *args[MAX_CMD_ARG_COUNT], int argCount);
+    int Aggregate_Scalar(char *args[MAX_CMD_ARG_COUNT], int argCount, int opType, const std::string& alias, double& value_out);
+    int Aggregate_Distinct(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& alias, int& value_out);
+    int Aggregate_TopK_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& alias, int k, std::string& json_out);
+    int Aggregate_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& groupAlias, int opType, const std::string& valueAlias, std::string& json_out);
 };
 
 #endif

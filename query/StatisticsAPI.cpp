@@ -356,6 +356,30 @@ int StatisticsAPI::GetVarDistinctCount(int varname, BitMap* filter) {
     return distinctValues.size();
 }
 
+void StatisticsAPI::BuildHLL(int varname, BitMap* filter, HyperLogLog& h) {
+    Coffer* meta;
+    int ret = DeCompressCapsule(varname, meta);
+    if (ret <= 0 || meta == NULL || meta->data == NULL) {
+        return;
+    }
+    int totalCount = meta->lines;
+    char buffer[1024];
+    bool useFilter = (filter != NULL && filter->GetSize() > 0);
+    if (meta->eleLen > 0) {
+        for (int i = 0; i < totalCount; i++) {
+            if (useFilter && filter->GetValue(i) == 0) continue;
+            int len = ReadValue_Fixed(meta->data, i, meta->eleLen, buffer, sizeof(buffer));
+            if (len > 0) h.add(buffer, (size_t)len);
+        }
+    } else {
+        for (int i = 0; i < totalCount; i++) {
+            if (useFilter && filter->GetValue(i) == 0) continue;
+            int len = ReadValue_Diff(meta->data, meta->srcLen, i, buffer, sizeof(buffer));
+            if (len > 0) h.add(buffer, (size_t)len);
+        }
+    }
+}
+
 std::map<std::string, int> StatisticsAPI::GetVarFrequency(int varname, int topK, BitMap* filter) {
     std::map<std::string, int> frequency;
     Coffer* meta;

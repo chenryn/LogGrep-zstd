@@ -35,7 +35,7 @@ using namespace std;
 #define MAX_SESSION_SIZE      10  
 
 //multi thread ctrl
-#define MAX_THREAD_PARALLEL		1
+#define MAX_THREAD_PARALLEL		8
 #define MAX_FILE_CNT			    6000
 
 //#define DIR_PATH_DEFAULT		"/home/clove/ABout/Fastcgi"
@@ -84,6 +84,7 @@ using namespace std;
 // time-related types
 #define VAR_TYPE_TIMECOL   8  //.time column
 #define VAR_TYPE_TIMEINDEX 9  //.time index
+#define VAR_TYPE_BLOOM     10
 
 #define MAIN_PAT_NAME      VAR_TYPE_TMPLS//"templates.txt"
 #define SUBV_PAT_NAME      VAR_TYPE_VARLIST//"variables.txt"

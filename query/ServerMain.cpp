@@ -10,47 +10,136 @@
 #include <cstdio>
 #include "LogDispatcher.h"
 #include "Ingestor.h"
+#include "SPLParser.h"
 #include <map>
 #include <fstream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
+#include <dirent.h>
+extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path);
+static void recover_wal_dir(const std::string& dir);
 
 static std::map<std::string,std::string> g_index_map;
 static std::string g_index_cfg = std::string("indices.conf");
 static std::map<std::string, RollingWriter*> g_writers;
+static std::mutex g_writers_mtx;
+static std::atomic<int> g_pending_count{0};
 static void load_indices(){ std::ifstream in(g_index_cfg.c_str()); if(in.good()){ g_index_map.clear(); std::string line; while(std::getline(in, line)){ size_t eq=line.find('='); if(eq==std::string::npos) continue; std::string k=line.substr(0,eq); std::string v=line.substr(eq+1); if(!k.empty() && !v.empty()){ g_index_map[k]=v; } } in.close(); }
   if(g_index_map.empty()){ g_index_map["main"]=std::string("../lib_output_zip/Ssh"); g_index_map["ssh"]=std::string("../lib_output_zip/Ssh"); std::ofstream out(g_index_cfg.c_str(), std::ios::out|std::ios::trunc); if(out.good()){ for(auto &it: g_index_map){ out<<it.first<<"="<<it.second<<"\n"; } out.close(); } }
 }
 static void save_indices(){ std::ofstream out(g_index_cfg.c_str(), std::ios::out|std::ios::trunc); if(out.good()){ for(auto &it: g_index_map){ out<<it.first<<"="<<it.second<<"\n"; } out.close(); } }
-static RollingWriter* get_writer(const std::string& index){ auto it=g_index_map.find(index); if(it==g_index_map.end()) return nullptr; auto wit=g_writers.find(index); if(wit!=g_writers.end()) return wit->second; RollingWriter* w=new RollingWriter(it->second); g_writers[index]=w; return w; }
+static RollingWriter* get_writer(const std::string& index){ std::lock_guard<std::mutex> lk(g_writers_mtx); auto it=g_index_map.find(index); if(it==g_index_map.end()) return nullptr; auto wit=g_writers.find(index); if(wit!=g_writers.end()) return wit->second; RollingWriter* w=new RollingWriter(it->second); g_writers[index]=w; return w; }
 
 static void write_all(int fd, const char* buf, size_t len){ size_t off=0; while(off<len){ ssize_t n=::write(fd, buf+off, len-off); if(n<=0) return; off+=n; } }
 static std::string read_all(int fd){ std::string s; char buf[4096]; ssize_t n; while((n=::read(fd, buf, sizeof(buf)))>0){ s.append(buf, buf+n); if(s.find("\r\n\r\n")!=std::string::npos) break; } size_t pos=s.find("\r\n\r\n"); if(pos!=std::string::npos){ size_t hdrEnd=pos+4; size_t cl=0; size_t hpos=s.find("Content-Length:"); if(hpos!=std::string::npos){ size_t eol=s.find("\r\n", hpos); std::string v=s.substr(hpos+15, eol-(hpos+15)); cl=strtoul(v.c_str(), nullptr, 10); } while(s.size()-hdrEnd<cl){ n=::read(fd, buf, sizeof(buf)); if(n<=0) break; s.append(buf, buf+n); } } return s; }
 static void parse_request_line(const std::string& req, std::string& method, std::string& path){ size_t sp=req.find(' '); size_t sp2=req.find(' ', sp+1); method=req.substr(0, sp); path=req.substr(sp+1, sp2-sp-1); }
 static std::map<std::string,std::string> parse_kv(const std::string& body){ std::map<std::string,std::string> m; size_t i=0; while(i<body.size()){ size_t eq=body.find('=', i); if(eq==std::string::npos) break; size_t amp=body.find('&', eq+1); std::string k=body.substr(i, eq-i); std::string v=body.substr(eq+1, amp==std::string::npos? std::string::npos : amp-eq-1); for(size_t j=0;j<v.size();j++){ if(v[j]=='+') v[j]=' '; } m[k]=v; if(amp==std::string::npos) break; i=amp+1; } return m; }
 static void respond_json(int cfd, int code, const std::string& body){ char hdr[256]; snprintf(hdr, sizeof(hdr), "HTTP/1.1 %d OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", code, body.size()); write_all(cfd, hdr, strlen(hdr)); write_all(cfd, body.c_str(), body.size()); }
+static void respond_busy(int cfd){ const char* body = "{\"error\":\"server busy\"}"; char hdr[256]; snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body)); write_all(cfd, hdr, strlen(hdr)); write_all(cfd, body, strlen(body)); }
 
-int main(int argc, char** argv){ int port=8080; if(argc>1){ port=atoi(argv[1]); if(port<=0) port=8080; } int sfd=::socket(AF_INET, SOCK_STREAM, 0); int opt=1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); sockaddr_in addr; memset(&addr,0,sizeof(addr)); addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons(port); if(::bind(sfd, (sockaddr*)&addr, sizeof(addr))<0){ perror("bind"); return 1; } if(::listen(sfd, 16)<0){ perror("listen"); return 1; } printf("listening at http://localhost:%d\n", port);
-  load_indices();
-  while(true){ sockaddr_in caddr; socklen_t clen=sizeof(caddr); int cfd=::accept(sfd, (sockaddr*)&caddr, &clen); if(cfd<0) continue; std::string req=read_all(cfd); if(req.empty()){ ::close(cfd); continue; } std::string method,path; parse_request_line(req, method, path); size_t qpos=path.find('?'); std::string rpath = qpos==std::string::npos? path : path.substr(0,qpos); std::string qs = qpos==std::string::npos? std::string() : path.substr(qpos+1); if(rpath.size()>1 && rpath.back()=='/') rpath.pop_back(); size_t hdrEnd=req.find("\r\n\r\n"); std::string body= hdrEnd==std::string::npos? std::string() : req.substr(hdrEnd+4);
+static std::string pretty_json(const std::string& s){
+  std::string out; out.reserve(s.size()*2);
+  int indent=0; bool inStr=false; bool esc=false;
+  for(size_t i=0;i<s.size();i++){
+    char c=s[i];
+    if(esc){ out.push_back(c); esc=false; continue; }
+    if(c=='\\'){ out.push_back(c); if(inStr) esc=true; continue; }
+    if(c=='"'){ out.push_back(c); inStr=!inStr; continue; }
+    if(inStr){ out.push_back(c); continue; }
+    if(c=='{' || c=='['){ out.push_back(c); out.push_back('\n'); indent++; for(int k=0;k<indent;k++){ out.append("  "); } continue; }
+    if(c=='}' || c==']'){ out.push_back('\n'); if(indent>0) indent--; for(int k=0;k<indent;k++){ out.append("  "); } out.push_back(c); continue; }
+    if(c==','){ out.push_back(c); out.push_back('\n'); for(int k=0;k<indent;k++){ out.append("  "); } continue; }
+    if(c==':'){ out.push_back(c); out.push_back(' '); continue; }
+    if(c=='\r' || c=='\n' || c=='\t'){ continue; }
+    out.push_back(c);
+  }
+  return out;
+}
+
+static void recover_wal_dir(const std::string& dir){
+  auto crc32_calc = [](const char* data, size_t len){ uint32_t crc = 0xFFFFFFFFu; for(size_t i=0;i<len;i++){ uint8_t byte = (uint8_t)data[i]; crc ^= byte; for(int j=0;j<8;j++){ uint32_t mask = -(int)(crc & 1); crc = (crc >> 1) ^ (0xEDB88320u & mask); } } return ~crc; };
+  int retries = 3; const char* rv=getenv("LOGGREP_RECOVER_RETRIES"); if(rv){ int x=atoi(rv); if(x>0) retries=x; }
+  int throttle_ms = 50; const char* tv=getenv("LOGGREP_RECOVER_THROTTLE_MS"); if(tv){ int x=atoi(tv); if(x>=0) throttle_ms=x; }
+  DIR* d = opendir(dir.c_str());
+  if(!d) return;
+  struct dirent* ent;
+  while((ent = readdir(d))){
+    std::string n = ent->d_name;
+    if(n.size()>5 && n.find("wal_")==0 && n.find(".log")==n.size()-4){
+      std::string p = dir + std::string("/") + n;
+      FILE* f = fopen(p.c_str(), "r");
+      if(!f) continue;
+      std::string buf;
+      char tmp[8192];
+      size_t r;
+      while((r=fread(tmp,1,sizeof(tmp),f))>0){ buf.append(tmp,tmp+r); }
+      fclose(f);
+      long long ts = (long long)time(NULL)*1000LL;
+      std::string out = dir + std::string("/ing_recover_") + std::to_string(ts) + std::string(".log.zip");
+      int rc = -1; for(int i=0;i<retries;i++){ rc = compress_from_memory(buf.c_str(), (int)buf.size(), out.c_str()); if(rc==0) break; usleep(1000*throttle_ms); }
+      if(rc==0){
+        std::string mpath = out + std::string(".meta");
+        FILE* mf = fopen(mpath.c_str(), "w");
+        if(mf){
+          uint32_t crc = crc32_calc(buf.c_str(), buf.size());
+          int recs = 0; for(size_t i=0;i<buf.size();i++){ if(buf[i]=='\n') recs++; }
+          std::string meta;
+          meta.append("{");
+          meta.append("\"wal\":\""); meta.append(p); meta.append("\",");
+          meta.append("\"bytes\":"); meta.append(std::to_string(buf.size())); meta.append(",");
+          meta.append("\"records\":"); meta.append(std::to_string(recs)); meta.append(",");
+          meta.append("\"start_ms\":"); meta.append(std::to_string(ts)); meta.append(",");
+          meta.append("\"end_ms\":"); meta.append(std::to_string(ts)); meta.append(",");
+          meta.append("\"crc32\":"); meta.append(std::to_string(crc));
+          meta.append("}");
+          fwrite(meta.c_str(), 1, meta.size(), mf);
+          fclose(mf);
+        }
+        unlink(p.c_str());
+      }
+      usleep(1000*throttle_ms);
+    }
+  }
+  closedir(d);
+}
+
+static void handle_client(int cfd){ std::string req=read_all(cfd); if(req.empty()){ ::close(cfd); return; } std::string method,path; parse_request_line(req, method, path); size_t qpos=path.find('?'); std::string rpath = qpos==std::string::npos? path : path.substr(0,qpos); std::string qs = qpos==std::string::npos? std::string() : path.substr(qpos+1); if(rpath.size()>1 && rpath.back()=='/') rpath.pop_back(); size_t hdrEnd=req.find("\r\n\r\n"); std::string body= hdrEnd==std::string::npos? std::string() : req.substr(hdrEnd+4);
     if((method=="GET" || method=="HEAD") && rpath=="/health"){ respond_json(cfd, 200, std::string("{\"status\":\"ok\"}")); }
-    else if((method=="POST" || method=="GET") && rpath=="/query"){ auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string q= kv.count("q")? kv["q"]: std::string(); int limit= kv.count("limit")? atoi(kv["limit"].c_str()) : 100; if(index.empty()||q.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index or q\"}")); }
+    else if((method=="POST" || method=="GET") && rpath=="/query"){ auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string q= kv.count("q")? kv["q"]: std::string(); int limit= kv.count("limit")? atoi(kv["limit"].c_str()) : 100; bool want_pretty = kv.count("pretty") ? (!kv["pretty"].empty()) : false; if(index.empty()||q.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index or q\"}")); }
       else{
         auto it = g_index_map.find(index); if(it==g_index_map.end()){ respond_json(cfd, 400, std::string("{\"error\":\"unknown index\"}")); }
         else { std::string dir = it->second; LogDispatcher disp; int c=disp.Connect((char*)dir.c_str()); if(c<=0){ respond_json(cfd, 500, std::string("{\"error\":\"connect failed\"}")); }
         else{
-          char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(q); args[0]=(char*)mem[0].c_str(); std::string json; disp.SearchByWildcard_JSON(args, 1, limit, json); respond_json(cfd, 200, json); disp.DisConnect(); }
+          std::string baseq=q; bool handled=false; size_t barpos=baseq.find('|'); std::string right; std::string left;
+          if(barpos!=std::string::npos){ right=baseq.substr(barpos+1); left=baseq.substr(0,barpos); SPLCommand cmd; if(parse_spl(right, cmd)){
+              if(cmd.type==SPL_TIMECHART){ respond_json(cfd, 400, std::string("{\"error\":\"timechart not implemented\"}")); handled=true; }
+              else if(cmd.type==SPL_COUNT){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); int total = disp.CountByWildcard(args, 1); std::string out; out.append("{"); out.append("\"count\":"); out.append(std::to_string(total)); out.append("}"); respond_json(cfd, 200, out); handled=true; }
+              else if(cmd.type==SPL_COUNT_BY){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); std::string jout; disp.Aggregate_Group_JSON(args, 1, cmd.field, 10, std::string(), jout); respond_json(cfd, 200, jout); handled=true; }
+              else if(cmd.type==SPL_SUM || cmd.type==SPL_AVG || cmd.type==SPL_MIN || cmd.type==SPL_MAX){ int op=0; std::string func; if(cmd.type==SPL_SUM){ op=0; func="sum"; } else if(cmd.type==SPL_AVG){ op=1; func="avg"; } else if(cmd.type==SPL_MIN){ op=2; func="min"; } else { op=3; func="max"; } char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); double val=0.0; disp.Aggregate_Scalar(args, 1, op, cmd.field, val); std::string out; out.append("{"); out.append("\"op\":\""); out.append(func); out.append("\",\"field\":\""); out.append(cmd.field); out.append("\",\"value\":"); out.append(std::to_string(val)); out.append("}"); respond_json(cfd, 200, out); handled=true; }
+              else if(cmd.type==SPL_TOP){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); std::string jout; disp.Aggregate_TopK_JSON(args, 1, cmd.field, cmd.k, jout); respond_json(cfd, 200, jout); handled=true; }
+              else if(cmd.type==SPL_DISTINCT){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); int dv=0; disp.Aggregate_Distinct(args, 1, cmd.field, dv); std::string out; out.append("{"); out.append("\"op\":\"distinct\",\"field\":\""); out.append(cmd.field); out.append("\",\"value\":"); out.append(std::to_string(dv)); out.append("}"); respond_json(cfd, 200, out); handled=true; }
+              else if(cmd.type==SPL_GROUP_BY){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(left); args[0]=(char*)mem[0].c_str(); std::string jout; disp.Aggregate_Group_JSON(args, 1, cmd.group, cmd.op, cmd.valueAlias, jout); respond_json(cfd, 200, jout); handled=true; }
+            }
+          }
+          if(!handled){ char* args[MAX_CMD_ARG_COUNT]; std::vector<std::string> mem; mem.push_back(baseq); args[0]=(char*)mem[0].c_str(); std::string json; disp.SearchByWildcard_JSON(args, 1, limit, json); if(want_pretty){ std::string pj = pretty_json(json); respond_json(cfd, 200, pj); } else { respond_json(cfd, 200, json); } }
+          disp.DisConnect(); }
         }
       }
     }
-    else if(method=="POST" && rpath=="/_bulk"){ auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
+    else if(method=="POST" && rpath=="/_bulk"){ auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } const char* lms = getenv("LOGGREP_TEST_LATENCY_MS"); if(lms){ int ms = atoi(lms); if(ms>0){ usleep(ms*1000); } } std::string index = kv.count("index")? kv["index"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
       else { RollingWriter* w=get_writer(index); if(!w){ respond_json(cfd, 400, std::string("{\"error\":\"unknown index\"}")); }
         else {
           std::vector<std::string> lines; lines.reserve(1024);
           size_t pos2=0; while(pos2<body.size()){ size_t nl=body.find('\n', pos2); std::string line = body.substr(pos2, nl==std::string::npos? std::string::npos : nl-pos2); pos2 = nl==std::string::npos? body.size() : nl+1; if(line.empty()) continue; std::string t=line; size_t i=0; while(i<t.size() && (t[i]==' '||t[i]=='\t'||t[i]=='\r')) i++; if(i<t.size() && t[i]=='{' && t.find("\"index\"")!=std::string::npos) { continue; } lines.push_back(line); }
-          std::string seg; bool flushed=false; int n=w->bulk_append(lines, seg, flushed); std::string out; out.reserve(128); out.append("{"); out.append("\"ingested\":"); out.append(std::to_string(n)); out.append(",\"flushed\":"); out.append(flushed?"true":"false"); if(flushed){ out.append(",\"segment\":\""); out.append(seg); out.append("\""); } out.append("}"); respond_json(cfd, 200, out);
+          std::string seg; bool flushed=false; int n=w->bulk_append(lines, seg, flushed); bool synced=false; if(kv.count("sync") && !kv["sync"].empty()){ w->sync_wal(); synced=true; }
+          std::string out; out.reserve(160); out.append("{"); out.append("\"ingested\":"); out.append(std::to_string(n)); out.append(",\"flushed\":"); out.append(flushed?"true":"false"); if(flushed){ out.append(",\"segment\":\""); out.append(seg); out.append("\""); } out.append(",\"synced\":"); out.append(synced?"true":"false"); out.append("}"); respond_json(cfd, 200, out);
         }
       }
     }
-    else if((method=="GET" || method=="HEAD") && rpath=="/indices"){ std::string out; out.append("{"); out.append("\"indices\":{"); bool first=true; for(auto &it: g_index_map){ if(!first) out.append(","); first=false; out.append("\""); out.append(it.first); out.append("\":\""); out.append(it.second); out.append("\""); } out.append("}}"); respond_json(cfd, 200, out); }
+    else if((method=="GET" || method=="HEAD") && rpath=="/indices"){ std::string out; out.append("{"); out.append("\"indices\":{"); bool first=true; for(auto &it: g_index_map){ if(!first) out.append(","); first=false; out.append("\""); out.append(it.first); out.append("\":\""); out.append(it.second); out.append("\""); } out.append("},\"pending\":"); out.append(std::to_string(g_pending_count.load())); out.append("}"); respond_json(cfd, 200, out); }
     else if(method=="POST" && rpath=="/indices"){ auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string pathv = kv.count("path")? kv["path"]: std::string(); std::string del = kv.count("delete")? kv["delete"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
       else { if(!del.empty()){ auto it=g_index_map.find(index); if(it!=g_index_map.end()){ g_index_map.erase(it); save_indices(); } respond_json(cfd, 200, std::string("{\"ok\":true}")); }
         else if(pathv.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing path\"}")); }
@@ -58,6 +147,19 @@ int main(int argc, char** argv){ int port=8080; if(argc>1){ port=atoi(argv[1]); 
     }
     else{ respond_json(cfd, 404, std::string("{\"error\":\"not found\"}")); }
     ::close(cfd);
+}
+
+int main(int argc, char** argv){ int port=8080; if(argc>1){ port=atoi(argv[1]); if(port<=0) port=8080; } int sfd=::socket(AF_INET, SOCK_STREAM, 0); int opt=1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); sockaddr_in addr; memset(&addr,0,sizeof(addr)); addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons(port); if(::bind(sfd, (sockaddr*)&addr, sizeof(addr))<0){ perror("bind"); return 1; } if(::listen(sfd, 1024)<0){ perror("listen"); return 1; } printf("listening at http://localhost:%d\n", port);
+  load_indices();
+  for(auto &it: g_index_map){ recover_wal_dir(it.second); }
+  std::queue<int> q; std::mutex q_mtx; std::condition_variable q_cv; std::atomic<bool> stop(false);
+  int max_pending = 4096; const char* pv = getenv("LOGGREP_MAX_PENDING"); if(pv){ int x=atoi(pv); if(x>0) max_pending=x; }
+  unsigned int nWorkers = std::thread::hardware_concurrency(); if(nWorkers==0) nWorkers = 8; const char* wv=getenv("LOGGREP_WORKERS"); if(wv){ int x=atoi(wv); if(x>0) nWorkers=(unsigned int)x; }
+  std::vector<std::thread> workers; workers.reserve(nWorkers);
+  for(unsigned int i=0;i<nWorkers;i++){ workers.emplace_back([&](){ while(!stop.load()){ int cfd=-1; { std::unique_lock<std::mutex> lk(q_mtx); q_cv.wait(lk, [&](){ return stop.load() || !q.empty(); }); if(stop.load() && q.empty()) return; cfd = q.front(); q.pop(); g_pending_count.fetch_sub(1); } handle_client(cfd); } }); }
+  while(true){ sockaddr_in caddr; socklen_t clen=sizeof(caddr); int cfd=::accept(sfd, (sockaddr*)&caddr, &clen); if(cfd<0) continue; bool dropped=false; { std::lock_guard<std::mutex> lk(q_mtx); if((int)q.size() >= max_pending){ dropped=true; } else { q.push(cfd); g_pending_count.fetch_add(1); } }
+    if(dropped){ respond_busy(cfd); ::close(cfd); } else { q_cv.notify_one(); }
   }
+  stop.store(true); q_cv.notify_all(); for(auto &t: workers){ if(t.joinable()) t.join(); }
   return 0;
 }

@@ -15,27 +15,27 @@ from typing import List, Dict, Tuple, Set
 class VariableDiscoverer:
     """变量发现器，分析模板文件推断变量语义"""
     
-    # IP地址模式
     IP_PATTERN = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
-    
-    # 端口号模式（1-65535）
     PORT_PATTERN = re.compile(r'^\d{1,5}$')
-    
-    # 时间模式
     TIME_PATTERNS = [
-        re.compile(r'^\d{1,2}:\d{2}:\d{2}$'),  # HH:MM:SS
-        re.compile(r'^\d{1,2}:\d{2}$'),        # HH:MM
-        re.compile(r'^\d{4}-\d{2}-\d{2}$'),   # YYYY-MM-DD
-        re.compile(r'^\d{2}/\d{2}/\d{4}$'),   # MM/DD/YYYY
+        re.compile(r'^\d{1,2}:\d{2}:\d{2}$'),
+        re.compile(r'^\d{1,2}:\d{2}$'),
+        re.compile(r'^\d{4}-\d{2}-\d{2}$'),
+        re.compile(r'^\d{2}/\d{2}/\d{4}$'),
     ]
-    
-    # 用户名模式（字母数字下划线，3-20字符）
     USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_]{3,20}$')
-    
-    # 主机名模式
     HOSTNAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$')
+    IPV6_PATTERN = re.compile(r'^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$')
+    MAC_PATTERN = re.compile(r'^([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$')
+    EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+    URL_PATTERN = re.compile(r'^(https?|ftp)://[^\s]+$')
+    UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
+    HEX_LONG_PATTERN = re.compile(r'^[0-9a-fA-F]{16,}$')
+    FILEPATH_PATTERN = re.compile(r'^(/|[A-Za-z]:\\).+')
+    HTTP_METHODS = {"GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"}
+    HTTP_STATUS_PATTERN = re.compile(r'^\d{3}$')
     
-    def __init__(self, templates_file: str, variables_file: str = None, sample_limit: int = 100):
+    def __init__(self, templates_file: str = None, variables_file: str = None, sample_limit: int = 100):
         self.templates_file = templates_file
         self.variables_file = variables_file
         self.sample_limit = sample_limit  # 每个变量采样的最大样本数
@@ -44,12 +44,18 @@ class VariableDiscoverer:
         self.var_positions = defaultdict(list)  # {(template_id, var_index): var_id}
         
     def load_templates(self):
-        """加载模板文件"""
-        if not os.path.exists(self.templates_file):
+        """加载单个模板文件（向后兼容）"""
+        if not self.templates_file or not os.path.exists(self.templates_file):
             print(f"错误: 模板文件不存在: {self.templates_file}")
             return False
-        
-        with open(self.templates_file, 'r', encoding='utf-8', errors='ignore') as f:
+        return self.load_templates_file(self.templates_file)
+
+    def load_templates_file(self, path: str):
+        """加载指定模板文件并聚合到当前集合"""
+        if not os.path.exists(path):
+            print(f"错误: 模板文件不存在: {path}")
+            return False
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -73,7 +79,6 @@ class VariableDiscoverer:
                                 self.var_positions[(template_id, var_index)].append(var_id)
                         except ValueError:
                             continue
-        
         return True
     
     def load_variable_samples(self):
@@ -91,9 +96,14 @@ class VariableDiscoverer:
         """
         if not self.variables_file or not os.path.exists(self.variables_file):
             return False
-        
+        return self.load_variable_samples_file(self.variables_file)
+
+    def load_variable_samples_file(self, path: str):
+        """加载指定variables文件并聚合到当前集合"""
+        if not os.path.exists(path):
+            return False
         try:
-            with open(self.variables_file, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 current_var_id = None
                 sample_count = 0
                 in_value_section = False
@@ -187,64 +197,63 @@ class VariableDiscoverer:
         
         return True
     
-    def infer_from_values(self, var_id: int) -> List[str]:
-        """从实际变量值推断语义类型"""
+    def infer_from_values(self, var_id: int) -> Dict[str,int]:
         if var_id not in self.variables or not self.variables[var_id]:
-            return []
-        
+            return {}
         samples = self.variables[var_id]
-        if len(samples) == 0:
-            return []
-        
-        # 统计各类型的匹配数
         type_scores = defaultdict(int)
-        
-        for sample in samples[:min(50, len(samples))]:  # 最多检查50个样本
-            sample = sample.strip()
-            if not sample:
+        for sample in samples[:min(100, len(samples))]:
+            s = sample.strip()
+            if not s:
                 continue
-            
-            # IP地址
-            if self.IP_PATTERN.match(sample):
-                type_scores['ip'] += 1
-            # 端口号
-            elif self.PORT_PATTERN.match(sample):
+            if self.IP_PATTERN.match(s):
+                type_scores['ip'] += 3
+            elif self.IPV6_PATTERN.match(s):
+                type_scores['ipv6'] += 3
+            elif self.MAC_PATTERN.match(s):
+                type_scores['mac'] += 3
+            elif self.EMAIL_PATTERN.match(s):
+                type_scores['email'] += 3
+            elif self.URL_PATTERN.match(s):
+                type_scores['url'] += 3
+            elif self.UUID_PATTERN.match(s):
+                type_scores['uuid'] += 3
+            elif self.HEX_LONG_PATTERN.match(s):
+                type_scores['hash'] += 2
+            elif s in self.HTTP_METHODS:
+                type_scores['http_method'] += 2
+            elif self.HTTP_STATUS_PATTERN.match(s):
                 try:
-                    port = int(sample)
-                    if 1 <= port <= 65535:
-                        type_scores['port'] += 1
+                    code = int(s)
+                    if 100 <= code <= 599:
+                        type_scores['http_status'] += 2
                 except ValueError:
                     pass
-            # 时间格式
-            elif any(pattern.match(sample) for pattern in self.TIME_PATTERNS):
-                type_scores['time'] += 1
-            # 用户名
-            elif self.USERNAME_PATTERN.match(sample) and not sample.isdigit():
+            elif self.FILEPATH_PATTERN.match(s) or ('/' in s and not self.URL_PATTERN.match(s)):
+                type_scores['path'] += 1
+            elif self.PORT_PATTERN.match(s):
+                try:
+                    port = int(s)
+                    if 1 <= port <= 65535:
+                        type_scores['port'] += 2
+                except ValueError:
+                    pass
+            elif any(p.match(s) for p in self.TIME_PATTERNS):
+                type_scores['time'] += 2
+            elif self.USERNAME_PATTERN.match(s) and not s.isdigit():
                 type_scores['username'] += 1
-            # 主机名（包含点）
-            elif self.HOSTNAME_PATTERN.match(sample) and '.' in sample and not self.IP_PATTERN.match(sample):
+            elif self.HOSTNAME_PATTERN.match(s) and '.' in s and not self.IP_PATTERN.match(s):
                 type_scores['hostname'] += 1
-        
-        # 如果某个类型的匹配率超过50%，认为该变量是该类型
-        total_samples = len(samples)
-        semantic_types = []
-        for sem_type, count in type_scores.items():
-            if count * 2 >= total_samples:  # 至少50%匹配
-                semantic_types.append(sem_type)
-        
-        return semantic_types
+        return dict(type_scores)
     
     def infer_variable_semantic(self, var_id: int, template_id: int, var_index: int, 
                                 template_content: str) -> List[str]:
         """推断变量的语义类型（结合模板上下文和实际值）"""
-        semantic_types = []
+        semantic_scores = defaultdict(int)
+        value_scores = self.infer_from_values(var_id)
+        for k,v in value_scores.items():
+            semantic_scores[k] += v
         
-        # 1. 优先从实际变量值推断（更准确）
-        value_based_types = self.infer_from_values(var_id)
-        if value_based_types:
-            semantic_types.extend(value_based_types)
-        
-        # 2. 从模板上下文推断（作为补充）
         pattern = r'<V' + str(var_index) + r'>'
         matches = list(re.finditer(pattern, template_content))
         
@@ -257,32 +266,31 @@ class VariableDiscoverer:
             # 基于上下文关键词推断
             context_lower = context.lower()
             
-            if any(keyword in context_lower for keyword in ['ip', 'address', 'rhost', 'from']):
-                if 'ip' not in semantic_types:
-                    semantic_types.append('ip')
-            if any(keyword in context_lower for keyword in ['port', ':']):
-                # 检查是否是端口（通常在IP后面）
-                if ('port' not in semantic_types and 
-                    ('ip' in semantic_types or re.search(r'\d+\.\d+\.\d+\.\d+', context))):
-                    semantic_types.append('port')
-            if any(keyword in context_lower for keyword in ['user', 'username', 'logname', 'uid']):
-                if 'username' not in semantic_types:
-                    semantic_types.append('username')
-            if any(keyword in context_lower for keyword in ['host', 'hostname', 'server']):
-                if 'hostname' not in semantic_types:
-                    semantic_types.append('hostname')
-            if any(keyword in context_lower for keyword in ['time', 'date', 'timestamp']):
-                if 'timestamp' not in semantic_types:
-                    semantic_types.append('timestamp')
-            if any(keyword in context_lower for keyword in ['month', 'day', 'year']):
-                if 'date' not in semantic_types:
-                    semantic_types.append('date')
-            if any(keyword in context_lower for keyword in ['hour', 'minute', 'second']):
-                if 'time' not in semantic_types:
-                    semantic_types.append('time')
+            if any(k in context_lower for k in ['ip','address','rhost','from','remoteaddr']):
+                semantic_scores['ip'] += 2
+            if any(k in context_lower for k in ['port',':']):
+                if re.search(r'\d+\.\d+\.\d+\.\d+', context):
+                    semantic_scores['port'] += 2
+            if any(k in context_lower for k in ['user','username','logname','uid','account']):
+                semantic_scores['username'] += 2
+            if any(k in context_lower for k in ['host','hostname','server','node']):
+                semantic_scores['hostname'] += 2
+            if any(k in context_lower for k in ['time','date','timestamp','ts']):
+                semantic_scores['timestamp'] += 2
+            if any(k in context_lower for k in ['month','day','year']):
+                semantic_scores['date'] += 1
+            if any(k in context_lower for k in ['hour','minute','second','ms']):
+                semantic_scores['time'] += 1
+            if any(k in context_lower for k in ['pid','process']):
+                semantic_scores['pid'] += 2
+            if any(k in context_lower for k in ['method']):
+                semantic_scores['http_method'] += 2
+            if any(k in context_lower for k in ['status','code']):
+                semantic_scores['http_status'] += 2
+            if any(k in context_lower for k in ['uri','url','path']):
+                semantic_scores['path'] += 2
         
-        # 3. 如果没有推断出类型，尝试基于变量位置推断
-        if not semantic_types:
+        if not semantic_scores:
             # 检查模板中变量的顺序模式
             all_vars = re.findall(r'<V(\d+)>', template_content)
             if str(var_index) in all_vars:
@@ -290,13 +298,29 @@ class VariableDiscoverer:
                 
                 # 常见模式：时间、主机、用户、IP、端口
                 if var_pos == 0:
-                    semantic_types.append('time')
+                    semantic_scores['time'] += 1
                 elif var_pos == 1:
-                    semantic_types.append('time')
+                    semantic_scores['time'] += 1
                 elif 'LabSZ' in template_content and var_pos < 3:
-                    semantic_types.append('time')
+                    semantic_scores['time'] += 1
         
-        return list(set(semantic_types))  # 去重
+        # 归一与同义词
+        normalize = {
+            'timestamp':'time',
+            'ipv6':'ip',
+        }
+        final_scores = defaultdict(int)
+        for k,v in semantic_scores.items():
+            nk = normalize.get(k,k)
+            final_scores[nk] += v
+        # 选择分数最高的前2类
+        if not final_scores:
+            return []
+        sorted_types = sorted(final_scores.items(), key=lambda x: (-x[1], x[0]))
+        top = [t for t,_ in sorted_types[:2] if _ >= 2]
+        if not top:
+            top = [sorted_types[0][0]]
+        return top
     
     def generate_suggestions(self) -> Dict[str, List[Tuple[int, int]]]:
         """生成别名建议"""
@@ -308,16 +332,11 @@ class VariableDiscoverer:
             var_id = var_ids[0] if var_ids else 0
             
             # 推断语义
-            semantic_types = self.infer_variable_semantic(
-                var_id, template_id, var_index, template_content
-            )
-            
+            semantic_types = self.infer_variable_semantic(var_id, template_id, var_index, template_content)
             if semantic_types:
-                # 使用第一个推断的类型作为别名
-                alias = semantic_types[0]
-                suggestions[alias].append((template_id, var_index))
+                for alias in semantic_types:
+                    suggestions[alias].append((template_id, var_index))
             else:
-                # 如果没有推断出类型，使用通用名称
                 alias = f"var_{template_id}_{var_index}"
                 suggestions[alias].append((template_id, var_index))
         
@@ -371,6 +390,7 @@ def main():
     parser.add_argument('compressed_dir', help='压缩文件目录路径')
     parser.add_argument('--output', '-o', help='输出配置文件路径（可选）')
     parser.add_argument('--zip-name', help='压缩文件名（不含.zip），默认使用目录名')
+    parser.add_argument('--all', action='store_true', help='聚合目录中所有压缩文件的模板与变量进行跨文件别名发现')
     
     args = parser.parse_args()
     
@@ -380,18 +400,15 @@ def main():
     variables_file = None
     zip_name = None
     
-    # 查找目录中的所有.templates文件
+    # 支持聚合多个压缩文件
+    template_files = []
+    variable_files = []
     for file in os.listdir(args.compressed_dir):
         if file.endswith('.zip.templates'):
-            templates_file = os.path.join(args.compressed_dir, file)
-            # 从文件名提取zip_name（去掉.zip.templates后缀）
-            zip_name = file.replace('.zip.templates', '')
-            # 查找对应的.variables文件
-            var_file = file.replace('.zip.templates', '.zip.variables')
-            var_path = os.path.join(args.compressed_dir, var_file)
-            if os.path.exists(var_path):
-                variables_file = var_path
-            break
+            template_files.append(os.path.join(args.compressed_dir, file))
+            var_file = os.path.join(args.compressed_dir, file.replace('.zip.templates', '.zip.variables'))
+            if os.path.exists(var_file):
+                variable_files.append(var_file)
     
     # 如果指定了zip_name，使用指定名称
     if args.zip_name:
@@ -399,7 +416,7 @@ def main():
         templates_file = os.path.join(args.compressed_dir, f"{zip_name}.zip.templates")
         variables_file = os.path.join(args.compressed_dir, f"{zip_name}.zip.variables")
     
-    if not templates_file or not os.path.exists(templates_file):
+    if (not template_files) and (not templates_file or not os.path.exists(templates_file)):
         print(f"错误: 找不到模板文件")
         print("提示: 请确保压缩文件目录包含 .zip.templates 文件")
         return 1
@@ -411,23 +428,33 @@ def main():
     discoverer = VariableDiscoverer(templates_file, variables_file)
     
     # 加载模板
-    print(f"正在分析模板文件: {templates_file}")
-    if not discoverer.load_templates():
-        return 1
+    if args.all:
+        print(f"正在聚合分析目录内 {len(template_files)} 个模板文件")
+        for tf in template_files:
+            print(f"  读取: {tf}")
+            discoverer.load_templates_file(tf)
+        for vf in variable_files:
+            print(f"  读取变量样本: {vf}")
+            discoverer.load_variable_samples_file(vf)
+    else:
+        print(f"正在分析模板文件: {templates_file}")
+        if not discoverer.load_templates():
+            return 1
     
     print(f"发现 {len(discoverer.templates)} 个模板")
     print(f"发现 {len(discoverer.var_positions)} 个变量位置")
     
     # 加载变量样本值（如果可用）
-    if variables_file and os.path.exists(variables_file):
-        print(f"正在加载变量样本值: {variables_file}")
-        if discoverer.load_variable_samples():
-            total_samples = sum(len(vals) for vals in discoverer.variables.values())
-            print(f"加载了 {len(discoverer.variables)} 个变量的 {total_samples} 个样本值")
+    if not args.all:
+        if variables_file and os.path.exists(variables_file):
+            print(f"正在加载变量样本值: {variables_file}")
+            if discoverer.load_variable_samples():
+                total_samples = sum(len(vals) for vals in discoverer.variables.values())
+                print(f"加载了 {len(discoverer.variables)} 个变量的 {total_samples} 个样本值")
+            else:
+                print("警告: 无法加载变量样本值，将仅基于模板上下文推断")
         else:
-            print("警告: 无法加载变量样本值，将仅基于模板上下文推断")
-    else:
-        print("提示: 未提供variables文件，将仅基于模板上下文推断")
+            print("提示: 未提供variables文件，将仅基于模板上下文推断")
     
     # 生成建议
     print("\n正在推断变量语义...")
@@ -445,7 +472,10 @@ def main():
     if args.output:
         output_file = args.output
     else:
-        output_file = os.path.join(args.compressed_dir, f"{zip_name}.zip.var_alias")
+        if args.all:
+            output_file = os.path.join(args.compressed_dir, "var_alias.conf")
+        else:
+            output_file = os.path.join(args.compressed_dir, f"{zip_name}.zip.var_alias")
     
     print(f"\n正在生成配置文件...")
     discoverer.generate_config(suggestions, output_file)

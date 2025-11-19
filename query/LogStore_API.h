@@ -88,9 +88,9 @@ private:
 	string VarAliasConfigPath;
 
 public:
-	RunningStatus RunStatus;
-	Statistics Statistic;
-	string FileName;
+    RunningStatus RunStatus;
+    Statistics Statistic;
+    string FileName;
 
 private:
 	int LoadFileToMem(const char *varname, int startPos, int bufLen, OUT char *mbuf);
@@ -145,6 +145,7 @@ private:
 	int GetDicOffsetByEntry(SubPattern* subpat, int dicNo, int& dicLen);
 	int GetVarOutliers_BM(int varName, const char *queryStr, int queryType, BitMap* bitmap, BitMap* refBitmap);
 	int FilterNumericVar(int varfname, const char* expr, BitMap* bitmap);
+	int CheckBloom(int varfname, const char* value);
 	int GetOutliers_MultiToken(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, BitMap* bitmap, bool beReverse=false);
 	int GetOutliers_SinglToken(char *arg, BitMap* bitmap, bool beReverse=false);
 	int GetOutliers_MultiToken_RefMap(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, BitMap* bitmap, BitMap* refbitmap, bool beReverse=false);
@@ -204,6 +205,16 @@ public:
     int SearchByReg(const char *regPattern);
     int SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum);
     int SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out);
+    int CountByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount);
+    int BuildBitmapsForQuery(char *args[MAX_CMD_ARG_COUNT], int argCount, LISTBITMAPS &bitmaps);
+    int GetMatchedTimeRange(char *args[MAX_CMD_ARG_COUNT], int argCount, long long& tmin, long long& tmax);
+    int Timechart_Count_BySpan(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, std::map<long long,int>& buckets);
+    int Timechart_Count_ByBins(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, std::vector<int>& counts);
+
+    int Test_AddPattern(const char* content, int eid, int count);
+    int Test_QuerySingle(const char* token, LISTBITMAPS& bitmaps);
+    int Test_QueryLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, LISTBITMAPS& bitmaps);
+    int Test_InitOutliersMeta(int lines);
 
 };
 

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -19,12 +20,20 @@ private:
     std::deque<std::string> m_segments;
     int m_max_segments;
     int m_seq;
+    std::mutex mtx;
+    int m_wal_fd;
+    std::string m_wal_path;
+    bool m_fsync_wal;
+    long long m_start_ms;
     long long now_ms();
     void ensure_dir();
+    void open_new_wal();
+    void fsync_wal();
 public:
     RollingWriter(const std::string& dir);
     int append(const std::string& line);
     int bulk_append(const std::vector<std::string>& lines, std::string& out_segment, bool& flushed);
+    int sync_wal();
 };
 
 #endif

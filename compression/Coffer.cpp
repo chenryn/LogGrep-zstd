@@ -64,7 +64,15 @@ Coffer::~Coffer()
 int Coffer::compress(string compression_method, int compression_level){
     size_t com_space_size = ZSTD_compressBound(srcLen);
     cdata = new Byte[com_space_size];
-    destLen = ZSTD_compress(cdata, com_space_size, data, srcLen, compression_level);
+    int nb = 0; const char* wv = getenv("LOGGREP_ZSTD_WORKERS"); if(wv){ nb = atoi(wv); if(nb<0) nb=0; }
+    if(nb > 0){
+        ZSTD_CCtx* cctx = ZSTD_createCCtx();
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, nb);
+        destLen = ZSTD_compress2(cctx, cdata, com_space_size, data, srcLen);
+        ZSTD_freeCCtx(cctx);
+    } else {
+        destLen = ZSTD_compress(cdata, com_space_size, data, srcLen, compression_level);
+    }
     compressed = 1;
     return destLen;
 }

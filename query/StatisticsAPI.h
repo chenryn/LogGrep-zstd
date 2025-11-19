@@ -3,6 +3,7 @@
 
 #include "LogStore_API.h"
 #include "../compression/Coffer.h"
+#include "HLL.h"
 #include <map>
 #include <vector>
 #include <string>
@@ -77,6 +78,7 @@ public:
     
     // 获取唯一值数量
     int GetVarDistinctCount(int varname, BitMap* filter = NULL);
+    void BuildHLL(int varname, BitMap* filter, HyperLogLog& h);
     
     // 获取频率分布（返回 Top-K）
     std::map<std::string, int> GetVarFrequency(int varname, int topK = 10, BitMap* filter = NULL);

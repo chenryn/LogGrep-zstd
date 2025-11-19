@@ -6,6 +6,16 @@
 #include<cstdio>
 #include<map>
 using namespace std;
+static unsigned int stable_id_from_string(const std::string& s){
+    unsigned int hash = 2166136261u;
+    for(unsigned char c : s){
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    hash &= 0xFFFFu;
+    if(hash == 0) hash = 1;
+    return hash;
+}
 LengthParser::LengthParser(double _threashold) {
     now_eid = 1;
     delim = " \t:=,";
@@ -108,10 +118,13 @@ int LengthParser::SearchTemplate(char* logs, SegTag segArray[MAXTOCKEN], int toc
             }else{
                 int totVar = temp -> varLength;
                 int now_eid = temp -> Eid;
+                unsigned int sid = stable_id_from_string(temp->output());
                 for (int i = 0; i < totVar; i++){
-                    int nowName = (now_eid<<POS_TEMPLATE) | (i<<POS_VAR);
-                    varMapping[nowName] ->Add(segArray[temp ->varIndex[i]].startPos, segArray[temp ->varIndex[i]].segLen);
-                    
+                    int nowName = (sid<<POS_TEMPLATE) | (i<<POS_VAR);
+                    if(varMapping.find(nowName) == varMapping.end() || varMapping[nowName] == NULL){
+                        varMapping[nowName] = new VarArray(nowName, 64);
+                    }
+                    varMapping[nowName]->Add(segArray[temp->varIndex[i]].startPos, segArray[temp->varIndex[i]].segLen);
                 }
                 return temp->Eid;
             }  
@@ -155,7 +168,9 @@ int LengthParser::getTemplate(char** longStr){
         }
     }
     for(vector<pair<int, int> >::iterator it = container.begin(); it != container.end(); it++){
-        output += "E" + to_string(it -> first) + " " + to_string(it -> second) + " " + AT[it -> first] + "\n";
+        string tpl = AT[it->first];
+        unsigned int sid = stable_id_from_string(tpl);
+        output += "E" + to_string(sid) + " " + to_string(it -> second) + " " + tpl + "\n";
         count++;
     }
     int ol = output.size();
