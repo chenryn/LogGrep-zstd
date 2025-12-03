@@ -8,6 +8,10 @@
 #include <unistd.h>
 #include <mutex>
 extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path);
+#include <string>
+#include <sys/stat.h>
+#include <cstdio>
+#include <cstdlib>
 #ifdef LOGGREP_LOCAL_STUB
 extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path){
     FILE* f = fopen(output_path, "w");

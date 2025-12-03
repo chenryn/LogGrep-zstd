@@ -1,6 +1,7 @@
 #include "StatisticsAPI.h"
 #include "SearchAlgorithm.h"
 #include "../compression/util.h"
+#include "HLL.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -797,6 +798,52 @@ std::map<std::string, int> StatisticsAPI::GetVarGroupByCount(int groupVar, BitMa
         }
     }
     
+    return result;
+}
+
+std::map<std::string, int> StatisticsAPI::GetVarGroupByDistinctCount(int groupVar, int valueVar, BitMap* filter) {
+    std::map<std::string, int> result;
+    Coffer* groupMeta;
+    Coffer* valueMeta;
+    int ret1 = DeCompressCapsule(groupVar, groupMeta);
+    int ret2 = DeCompressCapsule(valueVar, valueMeta);
+    if (ret1 <= 0 || ret2 <= 0 || groupMeta == NULL || valueMeta == NULL || groupMeta->data == NULL || valueMeta->data == NULL) {
+        return result;
+    }
+    int totalCount = groupMeta->lines;
+    if (totalCount != valueMeta->lines || totalCount <= 0) {
+        return result;
+    }
+    char groupBuffer[1024];
+    char valueBuffer[1024];
+    bool useFilter = (filter != NULL && filter->GetSize() > 0);
+    std::map<std::string, HyperLogLog> hllMap;
+    for (int i = 0; i < totalCount; i++) {
+        if (useFilter && filter->GetValue(i) == 0) {
+            continue;
+        }
+        int groupLen = 0;
+        if (groupMeta->eleLen > 0) {
+            groupLen = ReadValue_Fixed(groupMeta->data, i, groupMeta->eleLen, groupBuffer, sizeof(groupBuffer));
+        } else {
+            groupLen = ReadValue_Diff(groupMeta->data, groupMeta->srcLen, i, groupBuffer, sizeof(groupBuffer));
+        }
+        if (groupLen <= 0) continue;
+        int valueLen = 0;
+        if (valueMeta->eleLen > 0) {
+            valueLen = ReadValue_Fixed(valueMeta->data, i, valueMeta->eleLen, valueBuffer, sizeof(valueBuffer));
+        } else {
+            valueLen = ReadValue_Diff(valueMeta->data, valueMeta->srcLen, i, valueBuffer, sizeof(valueBuffer));
+        }
+        if (valueLen <= 0) continue;
+        std::string groupKey(groupBuffer, groupLen);
+        HyperLogLog& h = hllMap[groupKey];
+        if (&h == NULL) { /* noop */ }
+        h.add(valueBuffer, (size_t)valueLen);
+    }
+    for (auto it = hllMap.begin(); it != hllMap.end(); ++it) {
+        result[it->first] = (int)std::llround(it->second.estimate());
+    }
     return result;
 }
 

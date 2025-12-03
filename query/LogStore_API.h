@@ -89,6 +89,7 @@ private:
 
 public:
     RunningStatus RunStatus;
+    std::mutex m_runStatusMutex;
     Statistics Statistic;
     string FileName;
 
@@ -210,6 +211,8 @@ public:
     int GetMatchedTimeRange(char *args[MAX_CMD_ARG_COUNT], int argCount, long long& tmin, long long& tmax);
     int Timechart_Count_BySpan(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, std::map<long long,int>& buckets);
     int Timechart_Count_ByBins(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, std::vector<int>& counts);
+    int Timechart_Count_BySpan_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, const std::string& groupAlias, std::map<std::string, std::map<long long,int> >& gmap);
+    int Timechart_Count_ByBins_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, const std::string& groupAlias, std::map<std::string, std::vector<int> >& gout);
 
     int Test_AddPattern(const char* content, int eid, int count);
     int Test_QuerySingle(const char* token, LISTBITMAPS& bitmaps);

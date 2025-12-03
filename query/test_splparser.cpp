@@ -8,8 +8,11 @@ int main(){
   run("stats count by host");
   run("stats sum(bytes)");
   run("stats sum(bytes) by user");
+  run("stats distinct(user) by host");
   run("top(user,20)");
+  run("top 10 user");
   run("distinct(ip)");
+  run("stats distinct(ip)");
   run("by(host) avg(bytes)");
   run("timechart span=1m count() by host");
   return 0;

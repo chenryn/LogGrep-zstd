@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <atomic>
+#include <mutex>
 #include "LogDispatcher.h"
 #include "var_alias.h"
 #include "StatisticsAPI.h"
@@ -50,13 +51,16 @@ int LogDispatcher::Connect(char* dirPath)
 	int loadNum =0;
 	int totalFilesNum =0;
 	m_fileCnt =0;
+    auto has_suffix = [](const char* name, const char* suf){ size_t ln=strlen(name); size_t ls=strlen(suf); if(ls>ln) return false; return strncmp(name+ln-ls, suf, ls)==0; };
     while((file = readdir(d)) != NULL)
     {
-		if(strncmp(file->d_name, ".", 1) == 0 || strlen(file->d_name) < 3) continue;
-		SyslogDebug("%s %s\n", dirPath, file->d_name);
-		
-		LogStoreApi* logStore = new LogStoreApi();
-		loadNum = logStore->Connect(dirPath, file->d_name);
+        if(strncmp(file->d_name, ".", 1) == 0 || strlen(file->d_name) < 3) continue;
+        if(!(has_suffix(file->d_name, ".zip"))) continue;
+        if(has_suffix(file->d_name, ".zip.meta") || has_suffix(file->d_name, ".zip.variables") || has_suffix(file->d_name, ".zip.templates")) continue;
+        SyslogDebug("%s %s\n", dirPath, file->d_name);
+        
+        LogStoreApi* logStore = new LogStoreApi();
+        loadNum = logStore->Connect(dirPath, file->d_name);
 		if(loadNum > 0)
 		{
 			m_nServerHandle = 1;
@@ -135,6 +139,7 @@ int LogDispatcher::CalRunningTime()
 	Statistics glb_stat;
 	for (int itor = 0; itor < m_fileCnt; itor++)
 	{
+		std::lock_guard<std::mutex> lock(m_runningStatusMutex);
 		RunningStatus t = m_logStores[itor] ->RunStatus;
 		Statistics ss = m_logStores[itor]->Statistic;
 		runt.LogMetaTime += t.LogMetaTime;
@@ -344,18 +349,108 @@ int LogDispatcher::Aggregate_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCo
     int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
     std::vector< std::map<std::string,double> > gsumLoc(m_fileCnt);
     std::vector< std::map<std::string,long long> > gcountLoc(m_fileCnt);
-    struct GArg{ LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; const std::string* group; int op; const std::string* valAlias; std::vector< std::map<std::string,double> >* gsumLoc; std::vector< std::map<std::string,long long> >* gcountLoc; } a;
-    a.stores=m_logStores; a.fileCnt=m_fileCnt; a.nextIdx=&nextIdx; a.args=args; a.ac=argCount; a.group=&groupAlias; a.op=opType; a.valAlias=&valueAlias; a.gsumLoc=&gsumLoc; a.gcountLoc=&gcountLoc;
-    auto worker = [](void* p)->void*{ GArg* a=(GArg*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* logStore=a->stores[i]; LISTBITMAPS bitmaps; logStore->BuildBitmapsForQuery(a->args, a->ac, bitmaps); VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> gvids=mgr->getVarIds(*a->group); StatisticsAPI stats(logStore); std::map<std::string,double>& gsum=(*a->gsumLoc)[i]; std::map<std::string,long long>& gcount=(*a->gcountLoc)[i]; for(size_t gi=0; gi<gvids.size(); gi++){ int gvar=gvids[gi]; int pid=(gvar & 0xFFFF0000); LISTBITMAPS::iterator ib=bitmaps.find(pid); BitMap* filter=(ib!=bitmaps.end())? ib->second : NULL; if(a->op==10){ std::map<std::string,int> c=stats.GetVarGroupByCount(gvar + VAR_TYPE_VAR, filter); for(std::map<std::string,int>::iterator it=c.begin(); it!=c.end(); ++it){ gcount[it->first] += it->second; } } else if(a->op==11 || a->op==12){ std::vector<int> vvids=mgr->getVarIds(*a->valAlias); for(size_t vi=0; vi<vvids.size(); vi++){ int vvar=vvids[vi]; if((vvar & 0xFFFF0000) != pid) continue; std::map<std::string,double> s=stats.GetVarGroupBySum(gvar + VAR_TYPE_VAR, vvar + VAR_TYPE_VAR, filter); for(std::map<std::string,double>::iterator it=s.begin(); it!=s.end(); ++it){ gsum[it->first] += it->second; } std::map<std::string,int> c=stats.GetVarGroupByCount(gvar + VAR_TYPE_VAR, filter); for(std::map<std::string,int>::iterator it=c.begin(); it!=c.end(); ++it){ gcount[it->first] += it->second; } } } } for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; } } return NULL; };
+    std::vector< std::map<std::string,int> > gdistinctLoc(m_fileCnt);
+    struct GArg{ LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; const std::string* group; int op; const std::string* valAlias; std::vector< std::map<std::string,double> >* gsumLoc; std::vector< std::map<std::string,long long> >* gcountLoc; std::vector< std::map<std::string,int> >* gdistinctLoc; } a;
+    a.stores=m_logStores; a.fileCnt=m_fileCnt; a.nextIdx=&nextIdx; a.args=args; a.ac=argCount; a.group=&groupAlias; a.op=opType; a.valAlias=&valueAlias; a.gsumLoc=&gsumLoc; a.gcountLoc=&gcountLoc; a.gdistinctLoc=&gdistinctLoc;
+    auto worker = [](void* p)->void*{ GArg* a=(GArg*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* logStore=a->stores[i]; LISTBITMAPS bitmaps; logStore->BuildBitmapsForQuery(a->args, a->ac, bitmaps); VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> gvids=mgr->getVarIds(*a->group); StatisticsAPI stats(logStore); std::map<std::string,double>& gsum=(*a->gsumLoc)[i]; std::map<std::string,long long>& gcount=(*a->gcountLoc)[i]; std::map<std::string,int>& gdistinct=(*a->gdistinctLoc)[i]; for(size_t gi=0; gi<gvids.size(); gi++){ int gvar=gvids[gi]; int pid=(gvar & 0xFFFF0000); LISTBITMAPS::iterator ib=bitmaps.find(pid); BitMap* filter=(ib!=bitmaps.end())? ib->second : NULL; if(a->op==10){ std::map<std::string,int> c=stats.GetVarGroupByCount(gvar + VAR_TYPE_VAR, filter); for(std::map<std::string,int>::iterator it=c.begin(); it!=c.end(); ++it){ gcount[it->first] += it->second; } } else if(a->op==11 || a->op==12){ std::vector<int> vvids=mgr->getVarIds(*a->valAlias); for(size_t vi=0; vi<vvids.size(); vi++){ int vvar=vvids[vi]; if((vvar & 0xFFFF0000) != pid) continue; std::map<std::string,double> s=stats.GetVarGroupBySum(gvar + VAR_TYPE_VAR, vvar + VAR_TYPE_VAR, filter); for(std::map<std::string,double>::iterator it=s.begin(); it!=s.end(); ++it){ gsum[it->first] += it->second; } std::map<std::string,int> c=stats.GetVarGroupByCount(gvar + VAR_TYPE_VAR, filter); for(std::map<std::string,int>::iterator it=c.begin(); it!=c.end(); ++it){ gcount[it->first] += it->second; } } } else if(a->op==13){ std::vector<int> vvids=mgr->getVarIds(*a->valAlias); for(size_t vi=0; vi<vvids.size(); vi++){ int vvar=vvids[vi]; if((vvar & 0xFFFF0000) != pid) continue; std::map<std::string,int> d=stats.GetVarGroupByDistinctCount(gvar + VAR_TYPE_VAR, vvar + VAR_TYPE_VAR, filter); for(std::map<std::string,int>::iterator it=d.begin(); it!=d.end(); ++it){ gdistinct[it->first] += it->second; } } } } for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; } } return NULL; };
     std::vector<pthread_t> ths; ths.resize(n);
     for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker, &a); }
     for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
-    std::map<std::string,double> gsumMap; std::map<std::string,long long> gcountMap; for(int i=0;i<m_fileCnt;i++){ for(std::map<std::string,double>::iterator it=gsumLoc[i].begin(); it!=gsumLoc[i].end(); ++it){ gsumMap[it->first] += it->second; } for(std::map<std::string,long long>::iterator it2=gcountLoc[i].begin(); it2!=gcountLoc[i].end(); ++it2){ gcountMap[it2->first] += it2->second; } }
+    std::map<std::string,double> gsumMap; std::map<std::string,long long> gcountMap; std::map<std::string,int> gdistinctMap; for(int i=0;i<m_fileCnt;i++){ for(std::map<std::string,double>::iterator it=gsumLoc[i].begin(); it!=gsumLoc[i].end(); ++it){ gsumMap[it->first] += it->second; } for(std::map<std::string,long long>::iterator it2=gcountLoc[i].begin(); it2!=gcountLoc[i].end(); ++it2){ gcountMap[it2->first] += it2->second; } for(std::map<std::string,int>::iterator it3=gdistinctLoc[i].begin(); it3!=gdistinctLoc[i].end(); ++it3){ gdistinctMap[it3->first] += it3->second; } }
     json_out.clear(); json_out.append("["); bool first=true; if(opType==10){ for(std::map<std::string,long long>::iterator it=gcountMap.begin(); it!=gcountMap.end(); ++it){ if(!first) json_out.append(","); first=false; json_out.append("{\"key\":\""); const std::string& k=it->first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"value\":"); json_out.append(std::to_string((long long)it->second)); json_out.append("}"); } }
     if(opType==11){ for(std::map<std::string,double>::iterator it=gsumMap.begin(); it!=gsumMap.end(); ++it){ if(!first) json_out.append(","); first=false; json_out.append("{\"key\":\""); const std::string& k=it->first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"value\":"); json_out.append(std::to_string(it->second)); json_out.append("}"); } }
     if(opType==12){ for(std::map<std::string,double>::iterator it=gsumMap.begin(); it!=gsumMap.end(); ++it){ long long cc=gcountMap[it->first]; double v=cc>0? (it->second / (double)cc) : 0.0; if(!first) json_out.append(","); first=false; json_out.append("{\"key\":\""); const std::string& k=it->first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"value\":"); json_out.append(std::to_string(v)); json_out.append("}"); } }
+    if(opType==13){ for(std::map<std::string,int>::iterator it=gdistinctMap.begin(); it!=gdistinctMap.end(); ++it){ if(!first) json_out.append(","); first=false; json_out.append("{\"key\":\""); const std::string& k=it->first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"value\":"); json_out.append(std::to_string(it->second)); json_out.append("}"); } }
     json_out.append("]");
     return 0;
+}
+
+int LogDispatcher::Timechart_Count_BySpan_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, std::string& json_out)
+{
+    std::atomic<int> nextIdx(0);
+    int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
+    std::vector< std::map<long long,int> > locals(m_fileCnt);
+    struct A { LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; long long span; std::vector< std::map<long long,int> >* locals; } a;
+    a.stores=m_logStores; a.fileCnt=m_fileCnt; a.nextIdx=&nextIdx; a.args=args; a.ac=argCount; a.span=span_ms; a.locals=&locals;
+    auto worker = [](void* p)->void*{ A* a=(A*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* ls=a->stores[i]; std::map<long long,int> buckets; ls->Timechart_Count_BySpan(a->args, a->ac, a->span, buckets); (*a->locals)[i].swap(buckets); } return NULL; };
+    std::vector<pthread_t> ths; ths.resize(n);
+    for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker, &a); }
+    for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
+    std::map<long long,int> merged; for(int i=0;i<m_fileCnt;i++){ for(auto &kv: locals[i]){ merged[kv.first] += kv.second; } }
+    std::vector<std::pair<long long,int> > vec; vec.reserve(merged.size()); for(auto &kv: merged){ vec.push_back(kv); }
+    std::sort(vec.begin(), vec.end(), [](const std::pair<long long,int>& a, const std::pair<long long,int>& b){ return a.first < b.first; });
+    json_out.clear(); json_out.append("["); bool first=true; for(size_t i=0;i<vec.size();i++){ if(!first) json_out.append(","); first=false; json_out.append("{\"ts\":"); json_out.append(std::to_string(vec[i].first)); json_out.append(",\"count\":"); json_out.append(std::to_string(vec[i].second)); json_out.append("}"); }
+    json_out.append("]");
+    return (int)vec.size();
+}
+
+int LogDispatcher::Timechart_Count_ByBins_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, std::string& json_out)
+{
+    if(end_ms <= start_ms || bins <= 0){ json_out = "[]"; return 0; }
+    long long width = (end_ms - start_ms) / bins; if(width <= 0) width = 1;
+    std::atomic<int> nextIdx(0);
+    int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
+    std::vector< std::vector<int> > locals(m_fileCnt);
+    struct B { LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; long long s; long long e; int bins; std::vector< std::vector<int> >* locals; } b;
+    b.stores=m_logStores; b.fileCnt=m_fileCnt; b.nextIdx=&nextIdx; b.args=args; b.ac=argCount; b.s=start_ms; b.e=end_ms; b.bins=bins; b.locals=&locals;
+    auto worker2 = [](void* p)->void*{ B* a=(B*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* ls=a->stores[i]; std::vector<int> counts; ls->Timechart_Count_ByBins(a->args, a->ac, a->s, a->e, a->bins, counts); (*a->locals)[i].swap(counts); } return NULL; };
+    std::vector<pthread_t> ths; ths.resize(n);
+    for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker2, &b); }
+    for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
+    std::vector<int> merged(bins, 0); for(int i=0;i<m_fileCnt;i++){ const std::vector<int>& loc=locals[i]; for(int j=0;j<(int)loc.size() && j<bins; j++){ merged[j] += loc[j]; } }
+    json_out.clear(); json_out.append("["); bool first=true; for(int i=0;i<bins; i++){ if(!first) json_out.append(","); first=false; long long ts = start_ms + (long long)i * width; json_out.append("{\"ts\":"); json_out.append(std::to_string(ts)); json_out.append(",\"count\":"); json_out.append(std::to_string(merged[i])); json_out.append("}"); }
+    json_out.append("]");
+    return bins;
+}
+
+int LogDispatcher::GetMatchedTimeRange(char *args[MAX_CMD_ARG_COUNT], int argCount, long long& tmin, long long& tmax)
+{
+    tmin = LLONG_MAX; tmax = LLONG_MIN;
+    std::atomic<int> nextIdx(0);
+    int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
+    struct C { LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; long long* tmin; long long* tmax; } c;
+    c.stores=m_logStores; c.fileCnt=m_fileCnt; c.nextIdx=&nextIdx; c.args=args; c.ac=argCount; c.tmin=&tmin; c.tmax=&tmax;
+    auto worker3 = [](void* p)->void*{ C* a=(C*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* ls=a->stores[i]; long long lmin=LLONG_MAX, lmax=LLONG_MIN; int r=ls->GetMatchedTimeRange(a->args, a->ac, lmin, lmax); if(r>0){ if(lmin < *(a->tmin)) *(a->tmin) = lmin; if(lmax > *(a->tmax)) *(a->tmax) = lmax; } } return NULL; };
+    std::vector<pthread_t> ths; ths.resize(n);
+    for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker3, &c); }
+    for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
+    if(tmin==LLONG_MAX) return 0; return 1;
+}
+
+int LogDispatcher::Timechart_BySpan_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, const std::string& groupAlias, std::string& json_out)
+{
+    std::atomic<int> nextIdx(0);
+    int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
+    std::vector< std::map<std::string, std::map<long long,int> > > locals(m_fileCnt);
+    struct A{ LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; long long span; const std::string* grp; std::vector< std::map<std::string, std::map<long long,int> > >* locals; } a;
+    a.stores=m_logStores; a.fileCnt=m_fileCnt; a.nextIdx=&nextIdx; a.args=args; a.ac=argCount; a.span=span_ms; a.grp=&groupAlias; a.locals=&locals;
+    auto worker = [](void* p)->void*{ A* a=(A*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* ls=a->stores[i]; std::map<std::string, std::map<long long,int> > gm; ls->Timechart_Count_BySpan_Group(a->args, a->ac, a->span, *a->grp, gm); (*a->locals)[i].swap(gm); } return NULL; };
+    std::vector<pthread_t> ths; ths.resize(n);
+    for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker, &a); }
+    for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
+    std::map<std::string, std::map<long long,int> > merged; for(int i=0;i<m_fileCnt;i++){ for(auto &kv: locals[i]){ std::map<long long,int>& dst=merged[kv.first]; for(auto &kv2: kv.second){ dst[kv2.first] += kv2.second; } } }
+    json_out.clear(); json_out.append("["); bool firstG=true; for(auto &gkv: merged){ if(!firstG) json_out.append(","); firstG=false; json_out.append("{\"key\":\""); const std::string& k=gkv.first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"points\":["); bool first=false; std::vector<std::pair<long long,int> > vec; vec.reserve(gkv.second.size()); for(auto &kv: gkv.second){ vec.push_back(kv);} std::sort(vec.begin(), vec.end(), [](const std::pair<long long,int>& a, const std::pair<long long,int>& b){ return a.first < b.first; }); for(size_t i2=0;i2<vec.size();i2++){ if(first){ json_out.append(","); } first=true; json_out.append("{\"ts\":"); json_out.append(std::to_string(vec[i2].first)); json_out.append(",\"count\":"); json_out.append(std::to_string(vec[i2].second)); json_out.append("}"); } json_out.append("]}"); }
+    json_out.append("]");
+    return (int)merged.size();
+}
+
+int LogDispatcher::Timechart_ByBins_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, const std::string& groupAlias, std::string& json_out)
+{
+    if(end_ms<=start_ms || bins<=0){ json_out = "[]"; return 0; }
+    long long width=(end_ms-start_ms)/bins; if(width<=0) width=1;
+    std::atomic<int> nextIdx(0);
+    int n = m_fileCnt < MAX_THREAD_PARALLEL? m_fileCnt : MAX_THREAD_PARALLEL;
+    std::vector< std::map<std::string, std::vector<int> > > locals(m_fileCnt);
+    struct B{ LogStoreApi** stores; int fileCnt; std::atomic<int>* nextIdx; char** args; int ac; long long s; long long e; int bins; const std::string* grp; std::vector< std::map<std::string, std::vector<int> > >* locals; } b;
+    b.stores=m_logStores; b.fileCnt=m_fileCnt; b.nextIdx=&nextIdx; b.args=args; b.ac=argCount; b.s=start_ms; b.e=end_ms; b.bins=bins; b.grp=&groupAlias; b.locals=&locals;
+    auto worker2 = [](void* p)->void*{ B* a=(B*)p; while(true){ int i=a->nextIdx->fetch_add(1); if(i>=a->fileCnt) break; LogStoreApi* ls=a->stores[i]; std::map<std::string, std::vector<int> > gm; ls->Timechart_Count_ByBins_Group(a->args, a->ac, a->s, a->e, a->bins, *a->grp, gm); (*a->locals)[i].swap(gm); } return NULL; };
+    std::vector<pthread_t> ths; ths.resize(n);
+    for(int i=0;i<n;i++){ pthread_create(&ths[i], NULL, worker2, &b); }
+    for(int i=0;i<n;i++){ void* rv=NULL; pthread_join(ths[i], &rv); }
+    std::map<std::string, std::vector<int> > merged; for(int i=0;i<m_fileCnt;i++){ for(auto &kv: locals[i]){ std::vector<int>& dst=merged[kv.first]; if((int)dst.size()<bins) dst.resize(bins,0); const std::vector<int>& src=kv.second; for(int j=0;j<bins && j<(int)src.size(); j++){ dst[j] += src[j]; } } }
+    json_out.clear(); json_out.append("["); bool firstG=true; for(auto &gkv: merged){ if(!firstG) json_out.append(","); firstG=false; json_out.append("{\"key\":\""); const std::string& k=gkv.first; for(size_t j=0;j<k.size();j++){ char c=k[j]; if(c=='\"'||c=='\\'){ json_out.push_back('\\'); json_out.push_back(c);} else { json_out.push_back(c);} } json_out.append("\",\"points\":["); bool first=false; for(int bi=0; bi<bins; bi++){ if(first){ json_out.append(","); } first=true; long long ts = start_ms + (long long)bi * width; json_out.append("{\"ts\":"); json_out.append(std::to_string(ts)); json_out.append(",\"count\":"); json_out.append(std::to_string(gkv.second[bi])); json_out.append("}"); } json_out.append("]}"); }
+    json_out.append("]");
+    return (int)merged.size();
 }
 
 

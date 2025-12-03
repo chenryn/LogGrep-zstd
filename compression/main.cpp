@@ -186,7 +186,7 @@ int matchBuffer(char* mbuf, int len, LengthParser* parser, string zip_mode, int 
         return 0;
     }
     
-    SegTag segArray[MAXTOCKEN*100];
+    SegTag* segArray = new SegTag[MAXTOCKEN*100];
     int segSize=0;
     int segStart=0; int lineStart=0;
     int failLine =0;
@@ -237,9 +237,10 @@ int matchBuffer(char* mbuf, int len, LengthParser* parser, string zip_mode, int 
             segStart =i+1;
             segSize++;
         }
-	}
+    }
 	//SysDebug("Failed line: %d\n", failLine);
     if(zip_mode != "Z") cout << "Failed rate: " << (double)failLine / nowLine << endl;
+    delete [] segArray;
     return failLine;
 }
 
@@ -328,7 +329,7 @@ void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mod
         SysWarning("Invalid buffer data!\n");
         return;
     }
-    SegTag segArray[MAXTOCKEN * 100];
+    SegTag* segArray = new SegTag[MAXTOCKEN * 100];
     int segSize = 0;
     int segStart = 0, lineStart = 0;
 
@@ -442,8 +443,8 @@ void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mod
     
 
     
-    int failed_num[MAXLOG * 2];
-	char* failed_log[MAXLOG * 2];
+    int* failed_num = new int[MAXLOG * 2];
+    char** failed_log = new char*[MAXLOG * 2];
 	
     int nowline = 0;
     int failLine = matchBuffer(mbuf, len, &parser, zip_mode, Eid, failed_num, failed_log, variable_mapping, nowline);
@@ -682,6 +683,13 @@ void proc_buffer(char* buffer, int buffer_len, string output_path, string cp_mod
     for(auto &temp: variable_mapping){
         free(temp.second);
     }
+    if(failLine > 0){
+        for(int i=0;i<failLine;i++){
+            if(failed_log[i]) free(failed_log[i]);
+        }
+    }
+    delete [] failed_num;
+    delete [] failed_log;
 
     if(zip_mode != "Z") printf("stime: %lfs, mtime: %lfs, vtime:%lfs, ctime:%lfs\n", stime, mtime, vtime, ctime);
 //*/

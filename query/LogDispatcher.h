@@ -21,6 +21,7 @@ private:
 	int m_argCount;
 	int m_spid;//pid of each thread
 	RunningStatus m_runt;
+	std::mutex m_runningStatusMutex;
 
 private:
 	int CalRunningTime();
@@ -44,6 +45,11 @@ public:
     int Aggregate_Distinct(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& alias, int& value_out);
     int Aggregate_TopK_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& alias, int k, std::string& json_out);
     int Aggregate_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, const std::string& groupAlias, int opType, const std::string& valueAlias, std::string& json_out);
+    int Timechart_Count_BySpan_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, std::string& json_out);
+    int Timechart_Count_ByBins_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, std::string& json_out);
+    int Timechart_BySpan_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, const std::string& groupAlias, std::string& json_out);
+    int Timechart_ByBins_Group_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, const std::string& groupAlias, std::string& json_out);
+    int GetMatchedTimeRange(char *args[MAX_CMD_ARG_COUNT], int argCount, long long& tmin, long long& tmax);
 };
 
 #endif

@@ -12,6 +12,7 @@
 #include "../compression/TimeParser.h"
 #include <ctype.h>
 #include <strings.h>
+#include <mutex>
 
 static bool __contains_ic(const char* text, const char* pat);
 static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB, int& opType);
@@ -2050,94 +2051,94 @@ int LogStoreApi::RebuiltData_Subpat(char* data, int entryLen, int index, int no,
 
 int LogStoreApi::Materializ_Subpat(SubPattern* subpat, int varname, BitMap* bitmap, int entryCnt, OUT char* vars)
 {
-	string constStr = "";
-	int varIndex =0;
-	int offsetT, offsetV, constStrLen =0;
-	int subVarName = 0;
-	int outfilename = varname + VAR_TYPE_OUTLIER; 
-	//[0]: index of vars, [1]: index of outliers
-	int outlier_indexs[2][MAX_FILE_LEN]; 
-	int outlier_indexs_count=0;
-	for(int i=0;i< subpat->SegSize; i++)
-	{
-		if (subpat->SubSegAttr[i] == SEG_TYPE_CONST)//const
-		{
-			constStr = subpat->SubSegment[i];
-			constStrLen = strlen(constStr.c_str());
-		}
-		else//sub-attr
-		{
-			subVarName = varname | (varIndex<<4) | VAR_TYPE_SUB;
-			Coffer* entryMeta;
-			int ret = DeCompressCapsule(subVarName, entryMeta, 1);
-			if(ret <=0)
-			{
-				SyslogError("Materializ_Subpat: load subpat failed. %d\n", subVarName);
-				return 0;
-			} 
-			int entryLen = entryMeta->eleLen;
-			if(!bitmap->BeSizeFul())
-			{
-				if(INC_TEST_FIXED && entryLen > 0)
-				{
-					for(int j=0; j< entryCnt;j++)
-					{
-						int bitmapIndex = bitmap->GetIndex(j);
-						int tempIndex = RebuiltData_Subpat(entryMeta->data, entryLen, bitmapIndex, j, outfilename, constStr, vars);
-						if(tempIndex >=0)
-						{
-							outlier_indexs[0][outlier_indexs_count]=j;
-							outlier_indexs[1][outlier_indexs_count++]=tempIndex;
-						}
-					}
-				}
-				else
-				{
-					printf("under implementation!");
-				}
-			}
-			else
-			{
-				if(INC_TEST_FIXED && entryLen > 0)
-				{
-					for(int j=0;j< entryCnt;j++)
-					{
-						int tempIndex = RebuiltData_Subpat(entryMeta->data, entryLen, j, j, outfilename, constStr, vars);
-						if(tempIndex >=0)
-						{
-							outlier_indexs[0][outlier_indexs_count]=j;
-							outlier_indexs[1][outlier_indexs_count++]=tempIndex;
-						}
-					}
-				}
-				else
-				{
-					printf("under implementation!");
-				}
-			}
-			varIndex++;
-			constStr = "";//reset constStr
-		}
-	}
-	
-	if(constStr !="")// add the last const if exist
-	{
-		for(int i=0; i< entryCnt; i++)
-		{
-			offsetV = i * MAX_VALUE_LEN;
-			offsetV += strlen(vars + offsetV);
-			memcpy(vars + offsetV, constStr.c_str(), constStrLen);
-		}
-	}
-
-	if(m_varouts[outfilename] != NULL)
-	{
-		for(int outIndex =0; outIndex < outlier_indexs_count; outIndex++){
-			char* outData = m_varouts[outfilename] ->Outliers[outlier_indexs[1][outIndex]];
-			if(outData != NULL)
-				memcpy(vars + outlier_indexs[0][outIndex] * MAX_VALUE_LEN, outData, strlen(outData));
-		}
-	}
+    string constStr = "";
+    int varIndex =0;
+    int offsetT, offsetV, constStrLen =0;
+    int subVarName = 0;
+    int outfilename = varname + VAR_TYPE_OUTLIER; 
+    std::vector<int> out_idx_vars; out_idx_vars.reserve(entryCnt);
+    std::vector<int> out_idx_outs; out_idx_outs.reserve(entryCnt);
+    for(int i=0;i< subpat->SegSize; i++)
+    {
+        if (subpat->SubSegAttr[i] == SEG_TYPE_CONST)
+        {
+            constStr = subpat->SubSegment[i];
+            constStrLen = strlen(constStr.c_str());
+        }
+        else
+        {
+            subVarName = varname | (varIndex<<4) | VAR_TYPE_SUB;
+            Coffer* entryMeta;
+            int ret = DeCompressCapsule(subVarName, entryMeta, 1);
+            if(ret <=0)
+            {
+                SyslogError("Materializ_Subpat: load subpat failed. %d\n", subVarName);
+                return 0;
+            } 
+            int entryLen = entryMeta->eleLen;
+            if(!bitmap->BeSizeFul())
+            {
+                if(INC_TEST_FIXED && entryLen > 0)
+                {
+                    for(int j=0; j< entryCnt;j++)
+                    {
+                        int bitmapIndex = bitmap->GetIndex(j);
+                        int tempIndex = RebuiltData_Subpat(entryMeta->data, entryLen, bitmapIndex, j, outfilename, constStr, vars);
+                        if(tempIndex >=0)
+                        {
+                            out_idx_vars.push_back(j);
+                            out_idx_outs.push_back(tempIndex);
+                        }
+                    }
+                }
+                else
+                {
+                    printf("under implementation!");
+                }
+            }
+            else
+            {
+                if(INC_TEST_FIXED && entryLen > 0)
+                {
+                    for(int j=0;j< entryCnt;j++)
+                    {
+                        int tempIndex = RebuiltData_Subpat(entryMeta->data, entryLen, j, j, outfilename, constStr, vars);
+                        if(tempIndex >=0)
+                        {
+                            out_idx_vars.push_back(j);
+                            out_idx_outs.push_back(tempIndex);
+                        }
+                    }
+                }
+                else
+                {
+                    printf("under implementation!");
+                }
+            }
+            varIndex++;
+            constStr = "";
+        }
+    }
+    
+    if(constStr !="")
+    {
+        for(int i=0; i< entryCnt; i++)
+        {
+            offsetV = i * MAX_VALUE_LEN;
+            offsetV += strlen(vars + offsetV);
+            memcpy(vars + offsetV, constStr.c_str(), constStrLen);
+        }
+    }
+    
+    if(m_varouts[outfilename] != NULL)
+    {
+        for(size_t t=0; t< out_idx_outs.size(); ++t){
+            char* outData = m_varouts[outfilename] ->Outliers[out_idx_outs[t]];
+            if(outData != NULL)
+                memcpy(vars + out_idx_vars[t] * MAX_VALUE_LEN, outData, strlen(outData));
+        }
+    }
+    return 1;
 }
 
 //return:  count of records, -1: not find subpat
@@ -4025,91 +4026,258 @@ int LogStoreApi::SearchByLogic_norm_or(char *args[MAX_CMD_ARG_COUNT], int argCou
 
 int LogStoreApi::SearchByLogic_and(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, OUT LISTBITMAPS& bitmaps)
 {
-	int flag =0;//0: normal  1: with not
-	int temp =argCountS;
-	int notLen = strlen(LOGIC_NOT);
-	for(int i=argCountS; i<= argCountE; i++)
-	{
-		if(strlen(args[i]) == notLen && stricmp(args[i], LOGIC_NOT) == 0)
-		{
-			char queryStr[MAX_PATTERN_SIZE]={'\0'};
-			RecombineString(args, 0, i-2, queryStr);
-			LISTSESSIONS::iterator ifind = m_sessions.find(queryStr);
-			if(ifind == m_sessions.end())
-			{
-				if(flag == 1)
-				{
-					SearchByLogic_not(args, temp, i-2, bitmaps);
-				}
-				else if(temp <= i-2)
-				{
-					SearchByLogic_norm_or(args, temp, i-2, bitmaps);
-				}
-				if(INC_TEST_SESSION)//add to cache
-				{
-					DeepCloneMap(bitmaps, m_sessions[queryStr]);
-				}
-			}
-			else//enable cache 
-			{
-				DeepCloneMap(m_sessions[queryStr], bitmaps);
-			}
-			flag =1;
-			temp =i+2;
-			i++;
-		}
-	}
-	char queryChars[MAX_PATTERN_SIZE]={'\0'};
-	RecombineString(args, 0, argCountE, queryChars);
-	string queryStr(queryChars);
-	LISTSESSIONS::iterator ifind = m_sessions.find(queryStr);
-	if(ifind == m_sessions.end())
-	{
-		//COW (undo)
-		if(flag == 1)
-		{
-			SearchByLogic_not(args, temp, argCountE, bitmaps);
-		}
-		else
-		{
-			SearchByLogic_norm_or(args, temp, argCountE, bitmaps);
-		}
-		if(INC_TEST_SESSION)//add to cache
-		{
-			DeepCloneMap(bitmaps, m_sessions[queryStr]);
-		}
-	}
-	else
-	{
-		DeepCloneMap(m_sessions[queryStr], bitmaps);
-	}
-	return 0;
+    int flag = 0;
+    int temp = argCountS;
+    int notLen = strlen(LOGIC_NOT);
+    LISTBITMAPS acc;
+    for(int i=argCountS; i<= argCountE; i++)
+    {
+        if(strlen(args[i]) == notLen && stricmp(args[i], LOGIC_NOT) == 0)
+        {
+            LISTBITMAPS part;
+            if(flag == 1)
+            {
+                SearchByLogic_not(args, temp, i-2, part);
+            }
+            else if(temp <= i-2)
+            {
+                SearchByLogic_norm_or(args, temp, i-2, part);
+            }
+            if(acc.empty())
+            {
+                acc.swap(part);
+            }
+            else
+            {
+                LISTBITMAPS::iterator it = acc.begin();
+                while(it != acc.end())
+                {
+                    int pid = it->first;
+                    BitMap* cur = it->second;
+                    LISTBITMAPS::iterator ip = part.find(pid);
+                    BitMap* nxt = (ip!=part.end())? ip->second : NULL;
+                    if(!cur || !nxt)
+                    {
+                        if(cur) { delete cur; }
+                        it->second = NULL;
+                        ++it;
+                        continue;
+                    }
+                    if(cur->BeSizeFul())
+                    {
+                        delete cur;
+                        it->second = nxt;
+                    }
+                    else if(nxt->BeSizeFul())
+                    {
+                        delete nxt;
+                    }
+                    else
+                    {
+                        cur->Inset(nxt);
+                        delete nxt;
+                    }
+                    ++it;
+                }
+                for(LISTBITMAPS::iterator ip=part.begin(); ip!=part.end(); ++ip)
+                {
+                    if(acc.find(ip->first) == acc.end())
+                    {
+                        acc[ip->first] = NULL;
+                        if(ip->second) delete ip->second;
+                    }
+                }
+            }
+            flag = 1;
+            temp = i+2;
+            i++;
+        }
+    }
+    LISTBITMAPS last;
+    if(flag == 1)
+    {
+        SearchByLogic_not(args, temp, argCountE, last);
+    }
+    else
+    {
+        SearchByLogic_norm_or(args, temp, argCountE, last);
+    }
+    if(acc.empty())
+    {
+        acc.swap(last);
+    }
+    else
+    {
+        LISTBITMAPS::iterator it = acc.begin();
+        while(it != acc.end())
+        {
+            int pid = it->first;
+            BitMap* cur = it->second;
+            LISTBITMAPS::iterator ip = last.find(pid);
+            BitMap* nxt = (ip!=last.end())? ip->second : NULL;
+            if(!cur || !nxt)
+            {
+                if(cur) { delete cur; }
+                it->second = NULL;
+                ++it;
+                continue;
+            }
+            if(cur->BeSizeFul())
+            {
+                delete cur;
+                it->second = nxt;
+            }
+            else if(nxt->BeSizeFul())
+            {
+                delete nxt;
+            }
+            else
+            {
+                cur->Inset(nxt);
+                delete nxt;
+            }
+            ++it;
+        }
+        for(LISTBITMAPS::iterator ip=last.begin(); ip!=last.end(); ++ip)
+        {
+            if(acc.find(ip->first) == acc.end())
+            {
+                acc[ip->first] = NULL;
+                if(ip->second) delete ip->second;
+            }
+        }
+    }
+    for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it){ bitmaps[it->first] = it->second; }
+    return 0;
 }
 
 int LogStoreApi::SearchByLogic_OR(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, OUT LISTBITMAPS& bitmaps)
 {
-	int temp =argCountS;
-	int andLen = strlen(LOGIC_AND);
-	for(int i=argCountS; i<= argCountE; i++)
-	{
-		if(strlen(args[i]) == andLen && stricmp(args[i], LOGIC_AND) == 0)
-		{
-			SearchByLogic_and(args, temp, i-2, bitmaps);
-			temp = i+2;
-			i++;
-		}
-	}
-	SearchByLogic_and(args, temp, argCountE, bitmaps);
-	return 0;
+    int temp = argCountS;
+    int andLen = strlen(LOGIC_AND);
+    bool first = true;
+    LISTBITMAPS acc;
+    for(int i=argCountS; i<= argCountE; i++)
+    {
+        if(strlen(args[i]) == andLen && stricmp(args[i], LOGIC_AND) == 0)
+        {
+            LISTBITMAPS part;
+            SearchByLogic_and(args, temp, i-2, part);
+            if(first)
+            {
+                acc.swap(part);
+                first = false;
+            }
+            else
+            {
+                for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+                {
+                    int pid = it->first;
+                    BitMap* cur = it->second;
+                    LISTBITMAPS::iterator ip = part.find(pid);
+                    BitMap* nxt = (ip!=part.end())? ip->second : NULL;
+                    if(!cur || !nxt)
+                    {
+                        if(cur) { delete cur; }
+                        it->second = NULL;
+                        continue;
+                    }
+                    if(cur->BeSizeFul())
+                    {
+                        delete cur;
+                        it->second = nxt;
+                    }
+                    else if(nxt->BeSizeFul())
+                    {
+                        delete nxt;
+                    }
+                    else
+                    {
+                        cur->Inset(nxt);
+                        delete nxt;
+                    }
+                }
+                for(LISTBITMAPS::iterator ip=part.begin(); ip!=part.end(); ++ip)
+                {
+                    if(acc.find(ip->first) == acc.end())
+                    {
+                        acc[ip->first] = NULL;
+                        if(ip->second) delete ip->second;
+                    }
+                }
+            }
+            temp = i+2;
+            i++;
+        }
+    }
+    LISTBITMAPS last;
+    SearchByLogic_and(args, temp, argCountE, last);
+    if(first)
+    {
+        acc.swap(last);
+    }
+    else
+    {
+        for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+        {
+            int pid = it->first;
+            BitMap* cur = it->second;
+            LISTBITMAPS::iterator ip = last.find(pid);
+            BitMap* nxt = (ip!=last.end())? ip->second : NULL;
+            if(!cur || !nxt)
+            {
+                if(cur) { delete cur; }
+                it->second = NULL;
+                continue;
+            }
+            if(cur->BeSizeFul())
+            {
+                delete cur;
+                it->second = nxt;
+            }
+            else if(nxt->BeSizeFul())
+            {
+                delete nxt;
+            }
+            else
+            {
+                cur->Inset(nxt);
+                delete nxt;
+            }
+        }
+        for(LISTBITMAPS::iterator ip=last.begin(); ip!=last.end(); ++ip)
+        {
+            if(acc.find(ip->first) == acc.end())
+            {
+                acc[ip->first] = NULL;
+                if(ip->second) delete ip->second;
+            }
+        }
+    }
+    for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it){ bitmaps[it->first]=it->second; }
+    return 0;
 }
 
 int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT LISTBITMAPS& bitmaps)
 {
-    auto is_lp = [&](const char* s){ return strlen(s)==1 && s[0]=='('; };
-    auto is_rp = [&](const char* s){ return strlen(s)==1 && s[0]==')'; };
-    bool has_paren = false;
-    for(int i=0;i<argCount;i++){ if(is_lp(args[i])||is_rp(args[i])){ has_paren = true; break; } }
-    if(!has_paren){ SearchByLogic_OR(args, 0, argCount-1, bitmaps); return 0; }
+    std::vector<std::string> toks; toks.reserve(argCount*2);
+    for(int i=0;i<argCount;i++){
+        const char* s=args[i]; if(!s) continue; int n=(int)strlen(s); std::string buf; buf.reserve(n);
+        for(int j=0;j<n;j++){
+            char c=s[j];
+            if(c=='('||c==')'){
+                if(!buf.empty()){ toks.push_back(buf); buf.clear(); }
+                std::string t; t.push_back(c); toks.push_back(t);
+            } else { buf.push_back(c); }
+        }
+        if(!buf.empty()){ toks.push_back(buf); }
+    }
+    std::vector<char*> arr; arr.reserve(toks.size());
+    for(size_t i=0;i<toks.size();i++){ arr.push_back((char*)toks[i].c_str()); }
+    char** aargs = arr.empty()? args : (char**)arr.data();
+    int aCount = arr.empty()? argCount : (int)arr.size();
+    auto is_lp = [&](const char* s){ return s && strlen(s)==1 && s[0]=='('; };
+    auto is_rp = [&](const char* s){ return s && strlen(s)==1 && s[0]==')'; };
 
     struct Node { int t; int s; int e; Node* l; Node* r; Node* u; Node():t(0),s(0),e(0),l(NULL),r(NULL),u(NULL){} };
     auto is_and = [&](const char* s){ return stricmp(s, LOGIC_AND)==0; };
@@ -4123,19 +4291,19 @@ int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT 
     function<Node*()> parse_term;
 
     parse_term = [&](){
-        if(pos<argCount && is_lp(args[pos])){ pos++; Node* n = parse_expr(); if(pos<argCount && is_rp(args[pos])) pos++; return n; }
+        if(pos<aCount && is_lp(aargs[pos])){ pos++; Node* n = parse_expr(); if(pos<aCount && is_rp(aargs[pos])) pos++; return n; }
         int s = pos;
-        while(pos<argCount && !is_and(args[pos]) && !is_or(args[pos]) && !is_rp(args[pos])) pos++;
+        while(pos<aCount && !is_and(aargs[pos]) && !is_or(aargs[pos]) && !is_rp(aargs[pos])) pos++;
         Node* n = new Node(); n->t = 0; n->s = s; n->e = pos-1; return n;
     };
     parse_and = [&](){
         Node* left = NULL;
         bool neg = false;
-        while(pos<argCount){
-            if(is_rp(args[pos])) break;
-            if(is_or(args[pos])) break;
-            if(is_and(args[pos])){ pos++; continue; }
-            if(is_not(args[pos])){ neg = true; pos++; }
+        while(pos<aCount){
+            if(is_rp(aargs[pos])) break;
+            if(is_or(aargs[pos])) break;
+            if(is_and(aargs[pos])){ pos++; continue; }
+            if(is_not(aargs[pos])){ neg = true; pos++; }
             Node* term = parse_term();
             if(neg){ Node* nn = new Node(); nn->t = 3; nn->u = term; term = nn; neg=false; }
             if(!left){ left = term; }
@@ -4145,7 +4313,7 @@ int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT 
     };
     parse_or = [&](){
         Node* left = parse_and();
-        while(pos<argCount && is_or(args[pos])){ pos++; Node* right = parse_and(); Node* nn = new Node(); nn->t = 2; nn->l = left; nn->r = right; left = nn; }
+        while(pos<aCount && is_or(aargs[pos])){ pos++; Node* right = parse_and(); Node* nn = new Node(); nn->t = 2; nn->l = left; nn->r = right; left = nn; }
         return left;
     };
     parse_expr = [&](){ return parse_or(); };
@@ -4156,16 +4324,17 @@ int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT 
     function<LISTBITMAPS(Node*)> eval = [&](Node* n)->LISTBITMAPS{
         LISTBITMAPS res;
         if(!n) return res;
-        if(n->t==0){ SearchByLogic_norm(args, n->s, n->e, res); return res; }
+        if(n->t==0){ SearchByLogic_norm(aargs, n->s, n->e, res); return res; }
         if(n->t==3){ LISTBITMAPS a = eval(n->u); LISTBITMAPS full = build_full(); for(LISTBITMAPS::iterator it=full.begin(); it!=full.end(); ++it){ LISTBITMAPS::iterator ia = a.find(it->first); if(ia!=a.end() && ia->second){ it->second->Complement(ia->second); } res[it->first]=it->second; } return res; }
-        if(n->t==1){ LISTBITMAPS a = eval(n->l); LISTBITMAPS b = eval(n->r); for(LISTBITMAPS::iterator it=a.begin(); it!=a.end(); ++it){ LISTBITMAPS::iterator ib = b.find(it->first); if(ib!=b.end() && ib->second){ BitMap* bm = new BitMap(m_patterns[it->first]->Count); bm->SetSize(); bm->Inset(it->second); bm->Inset(ib->second); res[it->first]=bm; } } return res; }
+        if(n->t==1){ LISTBITMAPS a = eval(n->l); LISTBITMAPS b = eval(n->r); for(LISTBITMAPS::iterator it=a.begin(); it!=a.end(); ++it){ LISTBITMAPS::iterator ib = b.find(it->first); if(ib!=b.end() && ib->second && it->second){ BitMap* bm = new BitMap(m_patterns[it->first]->Count); bm->CloneFrom(it->second); bm->Inset(ib->second); res[it->first]=bm; } } return res; }
         if(n->t==2){ LISTBITMAPS a = eval(n->l); LISTBITMAPS b = eval(n->r); res = a; for(LISTBITMAPS::iterator it=b.begin(); it!=b.end(); ++it){ if(res[it->first]){ res[it->first]->Union(it->second); } else { res[it->first]=it->second; } } return res; }
         return res;
     };
 
     LISTBITMAPS tmp = eval(root);
-    for(LISTBITMAPS::iterator it=tmp.begin(); it!=tmp.end(); ++it){ bitmaps[it->first] = it->second; }
-    return 0;
+    int nonNull = 0;
+    for(LISTBITMAPS::iterator it=tmp.begin(); it!=tmp.end(); ++it){ bitmaps[it->first] = it->second; if(it->second && it->second->GetSize()>0) nonNull++; }
+    return nonNull>0 ? 1 : 0;
 }
 
 int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum)
@@ -4214,8 +4383,11 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
             if(bitmap_outlier->GetSize() == DEF_BITMAP_FULL){ bitmap_outlier->Reset(); }
         }
         bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
-        RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
-        RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+        {
+                std::lock_guard<std::mutex> lock(m_runStatusMutex);
+                RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
+                RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+            }
         SyslogPerf("It takes %lfs to single query.\n",RunStatus.SearchPatternTime);
         SyslogPerf("It takes %lfs to single outliers query.\n",RunStatus.SearchOutlierTime);
         }
@@ -4225,15 +4397,24 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
         if(ifind == m_sessions.end())
         {
             timeval tt1 = ___StatTime_Start();
-            Search_SingleSegment(fargs[0], bitmaps);
-			RunStatus.SearchPatternTime = ___StatTime_End(tt1);
-			timeval tt2 = ___StatTime_Start();
-			BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
-			bitmap_outlier->SetSize();
-            GetOutliers_SinglToken(fargs[0], bitmap_outlier);
-			bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
-			RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
-			RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+        Search_SingleSegment(fargs[0], bitmaps);
+        {
+            std::lock_guard<std::mutex> lock(m_runStatusMutex);
+            {
+                std::lock_guard<std::mutex> lock(m_runStatusMutex);
+                RunStatus.SearchPatternTime = ___StatTime_End(tt1);
+            }
+        }
+        timeval tt2 = ___StatTime_Start();
+        BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
+        bitmap_outlier->SetSize();
+        GetOutliers_SinglToken(fargs[0], bitmap_outlier);
+        bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
+        {
+            std::lock_guard<std::mutex> lock(m_runStatusMutex);
+            RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
+            RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
+        }
 			SyslogPerf("It takes %lfs to single query.\n",RunStatus.SearchPatternTime);
 			SyslogPerf("It takes %lfs to single outliers query.\n",RunStatus.SearchOutlierTime);
 			//session
@@ -4298,7 +4479,10 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
         {
             timeval tt1 = ___StatTime_Start();
             SearchByLogic(fargs, fcount, bitmaps);
-            RunStatus.SearchTotalTime = ___StatTime_End(tt1);
+            {
+                std::lock_guard<std::mutex> lock(m_runStatusMutex);
+                RunStatus.SearchTotalTime = ___StatTime_End(tt1);
+            }
             SyslogPerf("It takes %lfs to logic query.\n",RunStatus.SearchTotalTime);
         }
         
@@ -4451,10 +4635,61 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
         }
         else
         {
-            timeval tt1 = ___StatTime_Start();
-            SearchByLogic(fargs, fcount, bitmaps);
-            RunStatus.SearchTotalTime = ___StatTime_End(tt1);
-            ret = 1;
+            std::vector<std::string> ptoks; ptoks.reserve(fcount*2);
+            for(int i=0;i<fcount;i++){ const char* s=fargs[i]; if(!s) continue; int n=(int)strlen(s); std::string buf; buf.reserve(n); for(int j=0;j<n;j++){ char c=s[j]; if(c=='('||c==')'){ if(!buf.empty()){ ptoks.push_back(buf); buf.clear(); } } else { buf.push_back(c); } } if(!buf.empty()){ ptoks.push_back(buf); } }
+            std::vector<char*> cargs; cargs.reserve(ptoks.size()); for(size_t i=0;i<ptoks.size();i++){ cargs.push_back((char*)ptoks[i].c_str()); }
+            int ccount = (int)cargs.size();
+            bool has_and=false, has_or=false, has_not=false;
+            for(int i=0;i<ccount;i++){ if(stricmp(cargs[i], LOGIC_AND)==0) has_and=true; else if(stricmp(cargs[i], LOGIC_OR)==0 || stricmp(cargs[i], LOGIC_or)==0) has_or=true; else if(stricmp(cargs[i], LOGIC_NOT)==0) has_not=true; }
+            if(has_and && !has_or && !has_not)
+            {
+                int temp=0; LISTBITMAPS acc; bool first=true;
+                for(int i=0;i<ccount;i++)
+                {
+                    if(stricmp(cargs[i], LOGIC_AND)==0)
+                    {
+                        LISTBITMAPS part; SearchByLogic_norm((char**)cargs.data(), temp, i-1, part);
+                        if(first){ acc.swap(part); first=false; }
+                        else
+                        {
+                            for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+                            {
+                                int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=part.find(pid); BitMap* nxt=(ip!=part.end())?ip->second:NULL;
+                                if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
+                                if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
+                                else if(nxt->BeSizeFul()){ delete nxt; }
+                                else { cur->Inset(nxt); delete nxt; }
+                            }
+                            for(LISTBITMAPS::iterator ip=part.begin(); ip!=part.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
+                        }
+                        temp = i+1;
+                    }
+                }
+                LISTBITMAPS last; SearchByLogic_norm((char**)cargs.data(), temp, ccount-1, last);
+                if(first){ acc.swap(last); }
+                else
+                {
+                    for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+                    {
+                        int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=last.find(pid); BitMap* nxt=(ip!=last.end())?ip->second:NULL;
+                        if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
+                        if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
+                        else if(nxt->BeSizeFul()){ delete nxt; }
+                        else { cur->Inset(nxt); delete nxt; }
+                    }
+                    for(LISTBITMAPS::iterator ip=last.begin(); ip!=last.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
+                }
+                bitmaps.swap(acc);
+                RunStatus.SearchTotalTime = 0;
+                ret = 1;
+            }
+            else
+            {
+                timeval tt1 = ___StatTime_Start();
+                SearchByLogic(fargs, fcount, bitmaps);
+                RunStatus.SearchTotalTime = ___StatTime_End(tt1);
+                ret = 1;
+            }
         }
     }
     if(hasTime){ ApplyTimeFilterToBitmaps(bitmaps, tstart, tend); }
@@ -4479,6 +4714,7 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
             for(int i=0;i<doCnt;i++)
             {
                 int idx = bitmap->GetIndex(i);
+                        if (idx == -1) continue;
                 const char* line = m_outliers[idx];
                 if(!firstItem) json_out.append(",");
                 firstItem = false;
@@ -4495,8 +4731,9 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
             }
         }
         else
-        {
-            LogPattern* pat = m_patterns[pid];
+                {
+                    LogPattern* pat = m_patterns[pid];
+                    if (pat == NULL) { delete bitmap; continue; }
             CELL* output = new CELL[pat->SegSize];
             for(int i=0;i< pat->SegSize;i++)
             {
@@ -4614,10 +4851,61 @@ int LogStoreApi::CountByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCou
         }
         else
         {
-            timeval tt1 = ___StatTime_Start();
-            SearchByLogic(fargs, fcount, bitmaps);
-            RunStatus.SearchTotalTime = ___StatTime_End(tt1);
-            ret = 1;
+            std::vector<std::string> ptoks; ptoks.reserve(fcount*2);
+            for(int i=0;i<fcount;i++){ const char* s=fargs[i]; if(!s) continue; int n=(int)strlen(s); std::string buf; buf.reserve(n); for(int j=0;j<n;j++){ char c=s[j]; if(c=='('||c==')'){ if(!buf.empty()){ ptoks.push_back(buf); buf.clear(); } } else { buf.push_back(c); } } if(!buf.empty()){ ptoks.push_back(buf); } }
+            std::vector<char*> cargs; cargs.reserve(ptoks.size()); for(size_t i=0;i<ptoks.size();i++){ cargs.push_back((char*)ptoks[i].c_str()); }
+            int ccount = (int)cargs.size();
+            bool has_and=false, has_or=false, has_not=false;
+            for(int i=0;i<ccount;i++){ if(stricmp(cargs[i], LOGIC_AND)==0) has_and=true; else if(stricmp(cargs[i], LOGIC_OR)==0 || stricmp(cargs[i], LOGIC_or)==0) has_or=true; else if(stricmp(cargs[i], LOGIC_NOT)==0) has_not=true; }
+            if(has_and && !has_or && !has_not)
+            {
+                int temp=0; LISTBITMAPS acc; bool first=true;
+                for(int i=0;i<ccount;i++)
+                {
+                    if(stricmp(cargs[i], LOGIC_AND)==0)
+                    {
+                        LISTBITMAPS part; SearchByLogic_norm((char**)cargs.data(), temp, i-1, part);
+                        if(first){ acc.swap(part); first=false; }
+                        else
+                        {
+                            for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+                            {
+                                int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=part.find(pid); BitMap* nxt=(ip!=part.end())?ip->second:NULL;
+                                if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
+                                if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
+                                else if(nxt->BeSizeFul()){ delete nxt; }
+                                else { cur->Inset(nxt); delete nxt; }
+                            }
+                            for(LISTBITMAPS::iterator ip=part.begin(); ip!=part.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
+                        }
+                        temp = i+1;
+                    }
+                }
+                LISTBITMAPS last; SearchByLogic_norm((char**)cargs.data(), temp, ccount-1, last);
+                if(first){ acc.swap(last); }
+                else
+                {
+                    for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
+                    {
+                        int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=last.find(pid); BitMap* nxt=(ip!=last.end())?ip->second:NULL;
+                        if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
+                        if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
+                        else if(nxt->BeSizeFul()){ delete nxt; }
+                        else { cur->Inset(nxt); delete nxt; }
+                    }
+                    for(LISTBITMAPS::iterator ip=last.begin(); ip!=last.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
+                }
+                bitmaps.swap(acc);
+                RunStatus.SearchTotalTime = 0;
+                ret = 1;
+            }
+            else
+            {
+                timeval tt1 = ___StatTime_Start();
+                SearchByLogic(fargs, fcount, bitmaps);
+                RunStatus.SearchTotalTime = ___StatTime_End(tt1);
+                ret = 1;
+            }
         }
     }
     if(hasTime){ ApplyTimeFilterToBitmaps(bitmaps, tstart, tend); }
@@ -4708,6 +4996,61 @@ int LogStoreApi::Timechart_Count_ByBins(char *args[MAX_CMD_ARG_COUNT], int argCo
     if(m_timeValues.empty()){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
     for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ BitMap* bm=it->second; if(!bm) continue; int n=bm->GetSize(); for(int i=0;i<n;i++){ int idx=bm->GetIndex(i); if(idx>=0 && (size_t)idx<m_timeValues.size()){ long long v=m_timeValues[idx]; if(v<start_ms || v>end_ms) continue; long long off = v - start_ms; int bi = (int)(off / width); if(bi >= bins) bi = bins-1; counts[bi] += 1; } } delete bm; }
     return (int)counts.size();
+}
+
+static int __read_line_str(Coffer* meta, int index, char* buf, int buflen){
+    if(!meta || !meta->data || buflen<=0) return 0;
+    if(meta->eleLen > 0){ RemovePadding(meta->data + index * meta->eleLen, meta->eleLen, buf); int l=strlen(buf); return l; }
+    int lineIdx=0; int offset=0; char* p = meta->data; int sLen = meta->srcLen; while(p && (p - meta->data) < sLen && lineIdx < index){ if(*p=='\n') lineIdx++; p++; }
+    if(lineIdx != index) return 0; while(p && *p && *p!='\n' && offset<buflen-1){ buf[offset++] = *p++; } buf[offset]='\0'; return offset;
+}
+
+int LogStoreApi::Timechart_Count_BySpan_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, const std::string& groupAlias, std::map<std::string, std::map<long long,int> >& gmap)
+{
+    gmap.clear(); if(span_ms<=0) return 0; LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); if(r<=0){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    if(m_timeValues.empty()){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> vids=mgr->getVarIds(groupAlias);
+    for(size_t gi=0; gi<vids.size(); gi++){
+        int gvar = vids[gi]; int pid = (gvar & 0xFFFF0000);
+        LISTBITMAPS::iterator ib = bitmaps.find(pid);
+        BitMap* filter = (ib!=bitmaps.end())? ib->second : NULL; if(!filter) continue;
+        Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
+        int n = filter->GetSize(); char buf[1024];
+        for(int i=0;i<n;i++){
+            int idx = filter->GetIndex(i);
+            if(idx<0 || (size_t)idx>=m_timeValues.size()) continue;
+            long long v = m_timeValues[idx]; long long b = (v / span_ms) * span_ms;
+            int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+            gmap[key][b] += 1;
+        }
+    }
+    for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; }
+    return (int)gmap.size();
+}
+
+int LogStoreApi::Timechart_Count_ByBins_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, const std::string& groupAlias, std::map<std::string, std::vector<int> >& gout)
+{
+    gout.clear(); if(bins<=0) return 0; if(end_ms<=start_ms) return 0; long long width=(end_ms-start_ms)/bins; if(width<=0) width=1;
+    LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); if(r<=0){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    if(m_timeValues.empty()){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> vids=mgr->getVarIds(groupAlias);
+    for(size_t gi=0; gi<vids.size(); gi++){
+        int gvar = vids[gi]; int pid = (gvar & 0xFFFF0000);
+        LISTBITMAPS::iterator ib = bitmaps.find(pid);
+        BitMap* filter = (ib!=bitmaps.end())? ib->second : NULL; if(!filter) continue;
+        Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
+        std::vector<int>& counts = gout[std::string()]; // will move to key-specific after read
+        // we cannot pre-create for unknown keys; handle per-entry
+        int n = filter->GetSize(); char buf[1024];
+        for(int i=0;i<n;i++){
+            int idx = filter->GetIndex(i);
+            if(idx<0 || (size_t)idx>=m_timeValues.size()) continue; long long v=m_timeValues[idx]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
+            int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+            std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+        }
+    }
+    for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; }
+    return (int)gout.size();
 }
 
 int LogStoreApi::Test_AddPattern(const char* content, int eid, int count)

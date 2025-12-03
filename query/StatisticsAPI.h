@@ -90,8 +90,8 @@ public:
      * 组合统计
      */
     
-    // 按分组变量分组，计算数值变量的平均值
     std::map<std::string, double> GetVarGroupByAvg(int groupVar, int valueVar, BitMap* filter = NULL);
+    std::map<std::string, int> GetVarGroupByDistinctCount(int groupVar, int valueVar, BitMap* filter = NULL);
     
     // 按分组变量分组，计算数值变量的总和
     std::map<std::string, double> GetVarGroupBySum(int groupVar, int valueVar, BitMap* filter = NULL);

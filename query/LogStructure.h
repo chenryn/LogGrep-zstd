@@ -35,7 +35,7 @@ using namespace std;
 #define MAX_SESSION_SIZE      10  
 
 //multi thread ctrl
-#define MAX_THREAD_PARALLEL		8
+#define MAX_THREAD_PARALLEL		1
 #define MAX_FILE_CNT			    6000
 
 //#define DIR_PATH_DEFAULT		"/home/clove/ABout/Fastcgi"
@@ -815,7 +815,7 @@ class BitMap
           return i;
         }
       }
-      return 0;
+      return -1;
     }
 
     int BeSizeFul()

@@ -237,14 +237,25 @@ LcsMatch GetLCS_DPoptc(const char* str1, int size1, const char* str2, int size2,
     return res;
 }
 
+#include "LogStructure.h"
+
 int RecombineString(char* args[], int argCountS, int argCountE, char* queryStr)
 {
 	int offset=0;
 	for(int i=argCountS; i<= argCountE; i++)
 	{
-		offset = strlen(queryStr);
-		memcpy(queryStr + offset, args[i], strlen(args[i]));
+		int argLen = strlen(args[i]);
+		if (offset + argLen < MAX_PATTERN_SIZE - 1) {
+			memcpy(queryStr + offset, args[i], argLen);
+			offset += argLen;
+		} else {
+			// Handle potential overflow: truncate the string
+			memcpy(queryStr + offset, args[i], MAX_PATTERN_SIZE - 1 - offset);
+			offset = MAX_PATTERN_SIZE - 1;
+			break;
+		}
 	}
+	queryStr[offset] = '\0'; // Null-terminate the string
 	return 1;
 }
 
@@ -388,43 +399,52 @@ void BuildBadC(const char* pattern, int* &badc)
 }  
 
 void BuildGoodS(const char *pattern, int* &goods)
-{  
-	map<string, int*>::iterator itor = map_goods.find(pattern);
-	if(itor != map_goods.end())
-	{
-		goods = map_goods[pattern];
-		return;
-	}
+{
+    map<string, int*>::iterator itor = map_goods.find(pattern);
+    if(itor != map_goods.end())
+    {
+        goods = map_goods[pattern];
+        return;
+    }
 
-	goods = new int[MAX_PATTERN_SIZE];
-    unsigned int i, j, c;  
-	int pLen = strlen(pattern);
-    for(i = 0; i < MAX_PATTERN_SIZE; ++i)  
-    {  
+    goods = new int[MAX_PATTERN_SIZE];
+    unsigned int i, j, c; 
+    int pLen = strlen(pattern);
+    if(pLen == 0)
+    {
+        for(i = 0; i < MAX_PATTERN_SIZE; ++i)
+        {
+            goods[i] = 0;
+        }
+        map_goods[pattern] = goods;
+        return;
+    }
+    for(i = 0; i < MAX_PATTERN_SIZE; ++i)
+    {
         goods[i] = pLen;
-    }  
-  
-    goods[pLen - 1] = 1;   
-    for(i = pLen -1, c = 0; i != 0; --i)  
-    {  
-        for(j = 0; j < i; ++j)  
-        {  
-            if(memcmp(pattern + i, pattern + j, (pLen - i) * sizeof(char)) == 0)  
-            {  
-                if(j == 0)  
-                {  
-                    c = pLen - i;  
-                }  
-                else  
-                {  
-                    if(pattern[i - 1] != pattern[j - 1])  
-                    {  
-                        goods[i - 1] = j - 1;  
-                    }  
-                }  
-            }  
-        }  
-    }  
+    }
+
+    goods[pLen - 1] = 1;  
+    for(i = pLen -1, c = 0; i != 0; --i)
+    {
+        for(j = 0; j < i; ++j)
+        {
+            if(memcmp(pattern + i, pattern + j, (pLen - i) * sizeof(char)) == 0)
+            {
+                if(j == 0)
+                {
+                    c = pLen - i;
+                }
+                else
+                {
+                    if(pattern[i - 1] != pattern[j - 1])
+                    {
+                        goods[i - 1] = j - 1;
+                    }
+                }
+            }
+        }
+    }
       
     for(i = 0; i < pLen - 1; ++i)  
     {  
@@ -1355,12 +1375,13 @@ int BMwildcard_AxB(char *text, int lineCnt, int lineLen, const char *A, const ch
 //for outlier, using bm
 int QueryInStrArray_BM(char** targetStr, int lineCount, char *queryStr, BitMap* bitmap)
 {
-	if(bitmap == NULL || bitmap->GetSize() == 0) return 0;
-	int* badc;
-	int* goods;
-	InitBM(queryStr, badc, goods);
-	int matchResult;
-	int bitmapIndex =0;
+    if(bitmap == NULL || bitmap->GetSize() == 0) return 0;
+    if(queryStr == NULL || queryStr[0] == '\0') return bitmap->GetSize();
+    int* badc;
+    int* goods;
+    InitBM(queryStr, badc, goods);
+    int matchResult;
+    int bitmapIndex =0;
 	if(bitmap->BeSizeFul())
 	{
 		bitmap->Reset();
