@@ -137,13 +137,28 @@ static void recover_wal_dir(const std::string& dir){
   closedir(d);
 }
 
+static void compute_index_usage(const std::string& dir, int& segments, size_t& bytes){
+  segments = 0; bytes = 0;
+  DIR* d = opendir(dir.c_str());
+  if(!d) return;
+  struct dirent* ent;
+  while((ent = readdir(d))){
+    std::string n = ent->d_name;
+    if(n.size()>12 && n.find("ing_")==0 && n.rfind(".log.zip")==n.size()-8){
+      std::string p = dir + std::string("/") + n;
+      struct stat st; if(stat(p.c_str(), &st)==0){ segments++; bytes += (size_t)st.st_size; }
+    }
+  }
+  closedir(d);
+}
+
 static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.empty()){ ::close(cfd); return; } std::string method,path; parse_request_line(hdrs, method, path); size_t qpos=path.find('?'); std::string rpath = qpos==std::string::npos? path : path.substr(0,qpos); std::string qs = qpos==std::string::npos? std::string() : path.substr(qpos+1); if(rpath.size()>1 && rpath.back()=='/') rpath.pop_back(); size_t hdrEnd=hdrs.find("\r\n\r\n"); size_t contentLen = find_content_length(hdrs); std::string body;
     if((method=="GET" || method=="HEAD") && rpath=="/health"){ respond_json(cfd, 200, std::string("{\"status\":\"ok\"}")); }
     else if((method=="POST" || method=="GET") && rpath=="/query"){ if(contentLen>0){ body.reserve(contentLen); const size_t BUFSZ=1<<16; std::vector<char> tmp; tmp.resize(BUFSZ); size_t remain=contentLen; while(remain>0){ size_t toRead = remain>BUFSZ? BUFSZ: remain; ssize_t n=read_exact(cfd, tmp.data(), toRead); if(n<=0) break; body.append(tmp.data(), tmp.data()+n); remain -= (size_t)n; } }
       auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string q= kv.count("q")? kv["q"]: std::string(); int limit= kv.count("limit")? atoi(kv["limit"].c_str()) : 100; bool want_pretty = kv.count("pretty") ? (!kv["pretty"].empty()) : false; if(index.empty()||q.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index or q\"}")); }
       else{
         auto it = g_index_map.find(index); if(it==g_index_map.end()){ respond_json(cfd, 400, std::string("{\"error\":\"unknown index\"}")); }
-        else { std::string dir = it->second; LogDispatcher disp; int c=disp.Connect((char*)dir.c_str()); if(c<=0){ respond_json(cfd, 500, std::string("{\"error\":\"connect failed\"}")); }
+        else { std::string dir = it->second; LogDispatcher disp; int c=disp.Connect((char*)dir.c_str()); if(c<=0){ respond_json(cfd, 200, std::string("{\"error\":\"no segment\"}")); }
         else{
           std::string baseq=q; bool handled=false; size_t barpos=baseq.find('|'); std::string right; std::string left;
           if(barpos!=std::string::npos){ right=baseq.substr(barpos+1); left=baseq.substr(0,barpos); SPLCommand cmd; if(parse_spl(right, cmd)){
@@ -189,11 +204,12 @@ static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.
           bool chunked = has_chunked(hdrs); if(enc=="zstd"){ if(chunked){ stream_zstd_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); stream_zstd_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
           else { if(chunked){ stream_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); stream_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
           bool synced=false; if(kv.count("sync") && !kv["sync"].empty()){ w->sync_wal(); synced=true; }
+          if(kv.count("flush") && !kv["flush"].empty()){ std::string seg2; int fr = w->flush(seg2); if(!seg2.empty()){ anyFlushed=true; lastSeg=seg2; } }
           std::string out; out.reserve(160); out.append("{"); out.append("\"ingested\":"); out.append(std::to_string(total)); out.append(",\"flushed\":"); out.append(anyFlushed?"true":"false"); if(anyFlushed){ out.append(",\"segment\":\""); out.append(lastSeg); out.append("\""); } out.append(",\"synced\":"); out.append(synced?"true":"false"); out.append("}"); respond_json(cfd, 200, out);
         }
       }
     }
-    else if((method=="GET" || method=="HEAD") && rpath=="/indices"){ std::string out; out.append("{"); out.append("\"indices\":{"); bool first=true; for(auto &it: g_index_map){ if(!first) out.append(","); first=false; out.append("\""); out.append(it.first); out.append("\":\""); out.append(it.second); out.append("\""); } out.append("},\"pending\":"); out.append(std::to_string(g_pending_count.load())); out.append("}"); respond_json(cfd, 200, out); }
+    else if((method=="GET" || method=="HEAD") && rpath=="/indices"){ std::string out; out.append("{"); out.append("\"indices\":{"); bool first=true; for(auto &it: g_index_map){ if(!first) out.append(","); first=false; out.append("\""); out.append(it.first); out.append("\":\""); out.append(it.second); out.append("\""); } out.append("},\"stats\":{"); bool firsts=true; for(auto &it: g_index_map){ int segs=0; size_t bytes=0; compute_index_usage(it.second, segs, bytes); if(!firsts) out.append(","); firsts=false; out.append("\""); out.append(it.first); out.append("\":{"); out.append("\"segments\":"); out.append(std::to_string(segs)); out.append(",\"bytes\":"); out.append(std::to_string(bytes)); out.append("}"); } out.append("},\"pending\":"); out.append(std::to_string(g_pending_count.load())); out.append("}"); respond_json(cfd, 200, out); }
     else if(method=="POST" && rpath=="/indices"){ if(contentLen>0){ body.reserve(contentLen); const size_t BUFSZ=1<<16; std::vector<char> tmp; tmp.resize(BUFSZ); size_t remain=contentLen; while(remain>0){ size_t toRead = remain>BUFSZ? BUFSZ: remain; ssize_t n=read_exact(cfd, tmp.data(), toRead); if(n<=0) break; body.append(tmp.data(), tmp.data()+n); remain -= (size_t)n; } }
       auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string pathv = kv.count("path")? kv["path"]: std::string(); std::string del = kv.count("delete")? kv["delete"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
       else { if(!del.empty()){ auto it=g_index_map.find(index); if(it!=g_index_map.end()){ g_index_map.erase(it); save_indices(); } respond_json(cfd, 200, std::string("{\"ok\":true}")); }

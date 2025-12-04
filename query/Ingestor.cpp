@@ -12,6 +12,8 @@ extern "C" int compress_from_memory(const char* buffer, int buffer_len, const ch
 #include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
+#include <limits>
 #ifdef LOGGREP_LOCAL_STUB
 extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path){
     FILE* f = fopen(output_path, "w");
@@ -21,6 +23,26 @@ extern "C" int compress_from_memory(const char* buffer, int buffer_len, const ch
     return (w==(size_t)buffer_len)?0:-2;
 }
 #endif
+
+static size_t parse_size_bytes(const char* v){
+    if(!v || !*v) return 0;
+    while(*v==' '||*v=='\t') v++;
+    const char* p=v; while((*p>='0'&&*p<='9')||*p=='.') p++;
+    double num = strtod(v, nullptr);
+    size_t mult = 1;
+    std::string suf(p);
+    for(size_t i=0;i<suf.size();i++){ char c=suf[i]; if(c>='A'&&c<='Z') suf[i]=c-'A'+'a'; }
+    if(!suf.empty()){
+        if(suf[0]=='k') mult = 1024ULL;
+        else if(suf[0]=='m') mult = 1024ULL*1024ULL;
+        else if(suf[0]=='g') mult = 1024ULL*1024ULL*1024ULL;
+        else if(suf[0]=='t') mult = 1024ULL*1024ULL*1024ULL*1024ULL;
+    }
+    double val = num * (double)mult;
+    if(val <= 0.0) return 0;
+    if(val > (double)std::numeric_limits<size_t>::max()) return std::numeric_limits<size_t>::max();
+    return (size_t)val;
+}
 
 static std::string join_path(const std::string& a, const std::string& b){
     if(a.empty()) return b;
@@ -66,15 +88,17 @@ void RollingWriter::fsync_wal(){ if(m_fsync_wal && m_wal_fd>0){ ::fsync(m_wal_fd
 
 RollingWriter::RollingWriter(const std::string& dir)
     : m_dir(dir), m_buf(), m_bytes(0), m_records(0), m_flush_bytes(64*1024*1024), m_flush_records(50000),
-      m_last_flush_ms(0), m_flush_interval_ms(3000), m_segments(), m_max_segments(100), m_seq(0), m_wal_fd(-1), m_wal_path(), m_fsync_wal(false), m_start_ms(0){
+      m_last_flush_ms(0), m_flush_interval_ms(3000), m_segments(), m_max_segments(100), m_max_disk_bytes(0), m_segments_bytes(0), m_seq(0), m_wal_fd(-1), m_wal_path(), m_fsync_wal(false), m_start_ms(0){
     const char* v;
-    v=getenv("LOGGREP_FLUSH_BYTES"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_bytes=(size_t)x; }
+    v=getenv("LOGGREP_FLUSH_BYTES"); if(v){ size_t x=parse_size_bytes(v); if(x>0) m_flush_bytes=x; }
     v=getenv("LOGGREP_FLUSH_RECORDS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_records=(int)x; }
     v=getenv("LOGGREP_FLUSH_INTERVAL_MS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_interval_ms=x; }
     v=getenv("LOGGREP_MAX_SEGMENTS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_max_segments=(int)x; }
+    v=getenv("LOGGREP_MAX_DISK_BYTES"); if(v){ size_t x=parse_size_bytes(v); if(x>0) m_max_disk_bytes=x; }
     v=getenv("LOGGREP_WAL_FSYNC"); if(v){ int x=atoi(v); m_fsync_wal = (x>0); }
     ensure_dir();
     open_new_wal();
+    load_existing_segments();
 }
 
 int RollingWriter::append(const std::string& line){
@@ -118,6 +142,7 @@ int RollingWriter::bulk_append(const std::vector<std::string>& lines, std::strin
     int rc = compress_from_memory(m_buf.c_str(), (int)m_buf.size(), fpath.c_str());
     if(rc==0){
         m_segments.push_back(fpath);
+        struct stat stsz; if(stat(fpath.c_str(), &stsz)==0){ m_segments_bytes += (size_t)stsz.st_size; }
         m_buf.clear();
         m_bytes = 0;
         m_records = 0;
@@ -142,9 +167,10 @@ int RollingWriter::bulk_append(const std::vector<std::string>& lines, std::strin
         }
         if(m_wal_fd>0){ ::close(m_wal_fd); m_wal_fd=-1; ::unlink(m_wal_path.c_str()); }
         open_new_wal();
-        while((int)m_segments.size() > m_max_segments){
+        while((int)m_segments.size() > m_max_segments || (m_max_disk_bytes>0 && m_segments_bytes > m_max_disk_bytes)){
             std::string old = m_segments.front();
             m_segments.pop_front();
+            struct stat stod; if(stat(old.c_str(), &stod)==0){ size_t osz=(size_t)stod.st_size; if(m_segments_bytes>=osz) m_segments_bytes -= osz; }
             unlink(old.c_str());
         }
     }
@@ -152,3 +178,87 @@ int RollingWriter::bulk_append(const std::vector<std::string>& lines, std::strin
 }
 
 int RollingWriter::sync_wal(){ std::lock_guard<std::mutex> lk(mtx); fsync_wal(); return 0; }
+int RollingWriter::flush(std::string& out_segment){
+    std::lock_guard<std::mutex> lk(mtx);
+    out_segment.clear();
+    if(m_bytes==0 && m_records==0) return 0;
+    fsync_wal();
+    long long now = now_ms();
+    std::string fname = std::string("ing_") + std::to_string(now) + std::string("_") + std::to_string(m_seq++) + std::string(".log.zip");
+    std::string fpath = join_path(m_dir, fname);
+    size_t prev_bytes = m_bytes;
+    int prev_records = m_records;
+    long long start_ms = m_start_ms==0? now : m_start_ms;
+    long long end_ms = now;
+    uint32_t crc = crc32_calc(m_buf.c_str(), m_buf.size());
+    int rc = compress_from_memory(m_buf.c_str(), (int)m_buf.size(), fpath.c_str());
+    if(rc==0){
+        m_segments.push_back(fpath);
+        struct stat stsz; if(stat(fpath.c_str(), &stsz)==0){ m_segments_bytes += (size_t)stsz.st_size; }
+        m_buf.clear();
+        m_bytes = 0;
+        m_records = 0;
+        m_last_flush_ms = now;
+        m_start_ms = 0;
+        out_segment = fpath;
+        std::string mpath = fpath + std::string(".meta");
+        FILE* mf = fopen(mpath.c_str(), "w");
+        if(mf){
+            std::string meta;
+            meta.append("{");
+            meta.append("\"wal\":\""); meta.append(m_wal_path); meta.append("\",");
+            meta.append("\"bytes\":"); meta.append(std::to_string(prev_bytes)); meta.append(",");
+            meta.append("\"records\":"); meta.append(std::to_string(prev_records)); meta.append(",");
+            meta.append("\"start_ms\":"); meta.append(std::to_string(start_ms)); meta.append(",");
+            meta.append("\"end_ms\":"); meta.append(std::to_string(end_ms)); meta.append(",");
+            meta.append("\"crc32\":"); meta.append(std::to_string(crc));
+            meta.append("}");
+            fwrite(meta.c_str(), 1, meta.size(), mf);
+            fclose(mf);
+        }
+        if(m_wal_fd>0){ ::close(m_wal_fd); m_wal_fd=-1; ::unlink(m_wal_path.c_str()); }
+        open_new_wal();
+        while((int)m_segments.size() > m_max_segments || (m_max_disk_bytes>0 && m_segments_bytes > m_max_disk_bytes)){
+            std::string old = m_segments.front();
+            m_segments.pop_front();
+            struct stat stod; if(stat(old.c_str(), &stod)==0){ size_t osz=(size_t)stod.st_size; if(m_segments_bytes>=osz) m_segments_bytes -= osz; }
+            unlink(old.c_str());
+        }
+    }
+    return prev_records;
+}
+void RollingWriter::load_existing_segments(){
+    DIR* d = opendir(m_dir.c_str());
+    if(!d) return;
+    struct dirent* ent;
+    struct Item{ std::string path; long long ts; int seq; size_t sz; };
+    std::vector<Item> items;
+    while((ent = readdir(d))){
+        std::string n = ent->d_name;
+        if(n.size()>12 && n.find("ing_")==0 && n.rfind(".log.zip")==n.size()-8){
+            size_t u = n.find('_', 4);
+            size_t dot = n.rfind('.')==std::string::npos? n.size() : n.rfind('.');
+            if(u!=std::string::npos){
+                std::string tsStr = n.substr(4, u-4);
+                size_t u2 = n.find('_', u+1);
+                if(u2==std::string::npos) continue;
+                std::string seqStr = n.substr(u+1, u2-(u+1));
+                long long ts = strtoll(tsStr.c_str(), nullptr, 10);
+                int seq = atoi(seqStr.c_str());
+                std::string p = join_path(m_dir, n);
+                struct stat st; if(stat(p.c_str(), &st)==0){ items.push_back({p, ts, seq, (size_t)st.st_size}); }
+            }
+        }
+    }
+    closedir(d);
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b){ if(a.ts==b.ts) return a.seq<b.seq; return a.ts<b.ts; });
+    m_segments.clear();
+    m_segments_bytes = 0;
+    for(auto &it: items){ m_segments.push_back(it.path); m_segments_bytes += it.sz; }
+    while((int)m_segments.size() > m_max_segments || (m_max_disk_bytes>0 && m_segments_bytes > m_max_disk_bytes)){
+        std::string old = m_segments.front();
+        m_segments.pop_front();
+        struct stat stod; if(stat(old.c_str(), &stod)==0){ size_t osz=(size_t)stod.st_size; if(m_segments_bytes>=osz) m_segments_bytes -= osz; }
+        unlink(old.c_str());
+    }
+}

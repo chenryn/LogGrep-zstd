@@ -19,6 +19,8 @@ private:
     long long m_flush_interval_ms;
     std::deque<std::string> m_segments;
     int m_max_segments;
+    size_t m_max_disk_bytes;
+    size_t m_segments_bytes;
     int m_seq;
     std::mutex mtx;
     int m_wal_fd;
@@ -29,11 +31,13 @@ private:
     void ensure_dir();
     void open_new_wal();
     void fsync_wal();
+    void load_existing_segments();
 public:
     RollingWriter(const std::string& dir);
     int append(const std::string& line);
     int bulk_append(const std::vector<std::string>& lines, std::string& out_segment, bool& flushed);
     int sync_wal();
+    int flush(std::string& out_segment);
 };
 
 #endif
