@@ -4,6 +4,8 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,6 +29,9 @@ private:
     std::string m_wal_path;
     bool m_fsync_wal;
     long long m_start_ms;
+    std::thread m_flusher;
+    std::atomic<bool> m_stop;
+    void bg_worker();
     long long now_ms();
     void ensure_dir();
     void open_new_wal();
@@ -34,6 +39,7 @@ private:
     void load_existing_segments();
 public:
     RollingWriter(const std::string& dir);
+    ~RollingWriter();
     int append(const std::string& line);
     int bulk_append(const std::vector<std::string>& lines, std::string& out_segment, bool& flushed);
     int sync_wal();

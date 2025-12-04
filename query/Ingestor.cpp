@@ -88,17 +88,18 @@ void RollingWriter::fsync_wal(){ if(m_fsync_wal && m_wal_fd>0){ ::fsync(m_wal_fd
 
 RollingWriter::RollingWriter(const std::string& dir)
     : m_dir(dir), m_buf(), m_bytes(0), m_records(0), m_flush_bytes(64*1024*1024), m_flush_records(50000),
-      m_last_flush_ms(0), m_flush_interval_ms(3000), m_segments(), m_max_segments(100), m_max_disk_bytes(0), m_segments_bytes(0), m_seq(0), m_wal_fd(-1), m_wal_path(), m_fsync_wal(false), m_start_ms(0){
+      m_last_flush_ms(0), m_flush_interval_ms(3000), m_segments(), m_max_segments(100), m_max_disk_bytes(0), m_segments_bytes(0), m_seq(0), m_wal_fd(-1), m_wal_path(), m_fsync_wal(false), m_start_ms(0), m_flusher(), m_stop(false){
     const char* v;
     v=getenv("LOGGREP_FLUSH_BYTES"); if(v){ size_t x=parse_size_bytes(v); if(x>0) m_flush_bytes=x; }
     v=getenv("LOGGREP_FLUSH_RECORDS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_records=(int)x; }
-    v=getenv("LOGGREP_FLUSH_INTERVAL_MS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_interval_ms=x; }
+    v=getenv("LOGGREP_FLUSH_INTERVAL_MS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>=0) m_flush_interval_ms=x; }
     v=getenv("LOGGREP_MAX_SEGMENTS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_max_segments=(int)x; }
     v=getenv("LOGGREP_MAX_DISK_BYTES"); if(v){ size_t x=parse_size_bytes(v); if(x>0) m_max_disk_bytes=x; }
     v=getenv("LOGGREP_WAL_FSYNC"); if(v){ int x=atoi(v); m_fsync_wal = (x>0); }
     ensure_dir();
     open_new_wal();
     load_existing_segments();
+    m_flusher = std::thread([this](){ this->bg_worker(); });
 }
 
 int RollingWriter::append(const std::string& line){
@@ -226,6 +227,26 @@ int RollingWriter::flush(std::string& out_segment){
         }
     }
     return prev_records;
+}
+
+RollingWriter::~RollingWriter(){ m_stop.store(true); if(m_flusher.joinable()) m_flusher.join(); }
+
+void RollingWriter::bg_worker(){
+    const int SLEEP_MS = 100;
+    while(!m_stop.load()){
+        bool need=false;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if(m_flush_interval_ms>0 && m_records>0){
+                long long now = now_ms();
+                long long base = (m_last_flush_ms==0)? m_start_ms : m_last_flush_ms;
+                if(base==0) base = now;
+                if(now - base >= m_flush_interval_ms) need=true;
+            }
+        }
+        if(need){ std::string seg; flush(seg); }
+        usleep(1000*SLEEP_MS);
+    }
 }
 void RollingWriter::load_existing_segments(){
     DIR* d = opendir(m_dir.c_str());
