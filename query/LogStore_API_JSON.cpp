@@ -8,7 +8,7 @@
 #include <json-c/json.h>
 
 // JSON output function for materialized log lines with template info
-int LogStoreApi::Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, int matSize)
+int LogStoreApi::Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, int matSize, std::string &json_out)
 {
     int entryCnt = bitmapSize >= matSize ? matSize : bitmapSize;
     if(entryCnt <= 0) return entryCnt;
@@ -68,8 +68,17 @@ int LogStoreApi::Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, i
         delete[] log_line;
     }
     
-    // Print JSON array
-    printf("%s\n", json_object_to_json_string(json_array));
+    // Append to JSON output string
+    const char* str = json_object_to_json_string(json_array);
+    if (str) {
+        if (!json_out.empty() && json_out.back() == ']') {
+            json_out.pop_back();
+            if (json_out.length() > 1) json_out.append(",");
+            json_out.append(str + 1);
+        } else {
+            json_out.append(str);
+        }
+    }
     
     // Cleanup
     json_object_put(json_array);
@@ -91,7 +100,7 @@ int LogStoreApi::Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, i
 }
 
 // JSON output function for outliers
-int LogStoreApi::MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum)
+int LogStoreApi::MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum, std::string &json_out)
 {
     int doCnt = refNum > cnt ? cnt : refNum;
     if(doCnt <= 0) return doCnt;
@@ -110,14 +119,23 @@ int LogStoreApi::MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum)
         json_object_array_add(json_array, json_entry);
     }
     
-    printf("%s\n", json_object_to_json_string(json_array));
+    const char* str = json_object_to_json_string(json_array);
+    if (str) {
+        if (!json_out.empty() && json_out.back() == ']') {
+            json_out.pop_back();
+            if (json_out.length() > 1) json_out.append(",");
+            json_out.append(str + 1);
+        } else {
+            json_out.append(str);
+        }
+    }
     json_object_put(json_array);
     
     return doCnt;
 }
 
 // Modified search function to support JSON output
-int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum)
+int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out)
 {
     timeval t1 = ___StatTime_Start();
     LISTBITMAPS bitmaps;
@@ -128,6 +146,10 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
     {
         ret = SearchByLogic(args, argCount, bitmaps);
     }
+    else if (argCount > 1)
+    {
+        ret = Search_MultiSegments(args, argCount, bitmaps);
+    }
     else
     {
         ret = Search_SingleSegment(args[0], bitmaps);
@@ -135,28 +157,30 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
     
     if(ret <= 0)
     {
-        printf("[]\n");
+        json_out = "[]";
         return ret;
     }
     
+    json_out = "[]";
     // Process results with JSON output
     int totalCnt = 0;
     for(LISTBITMAPS::iterator iter = bitmaps.begin(); iter != bitmaps.end(); ++iter)
     {
-        int pid = atoi(iter->first.c_str());
+        int pid = iter->first;
         BitMap* bitmap = iter->second;
+        if (!bitmap) continue;
         
         if(pid < 0)
         {
             // Outlier case
-            MaterializOutlier_JSON(bitmap, bitmap->GetSize(), matNum - totalCnt);
-            totalCnt += min(bitmap->GetSize(), matNum - totalCnt);
+            MaterializOutlier_JSON(bitmap, bitmap->GetSize(), matNum - totalCnt, json_out);
+            totalCnt += (bitmap->GetSize() < matNum - totalCnt ? bitmap->GetSize() : matNum - totalCnt);
         }
         else
         {
             // Regular pattern case
-            Materialization_JSON(pid, bitmap, bitmap->GetSize(), matNum - totalCnt);
-            totalCnt += min(bitmap->GetSize(), matNum - totalCnt);
+            Materialization_JSON(pid, bitmap, bitmap->GetSize(), matNum - totalCnt, json_out);
+            totalCnt += (bitmap->GetSize() < matNum - totalCnt ? bitmap->GetSize() : matNum - totalCnt);
         }
         
         if(totalCnt >= matNum)

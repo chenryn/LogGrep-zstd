@@ -13,6 +13,32 @@
 #include <ctype.h>
 #include <strings.h>
 #include <mutex>
+#include <sstream>
+#include <iomanip>
+
+// JSON string escaping utility
+static std::string escape_json(const std::string& input) {
+    std::ostringstream ss;
+    for (char c : input) {
+        switch (c) {
+            case '\b': ss << "\\b"; break;
+            case '\f': ss << "\\f"; break;
+            case '\n': ss << "\\n"; break;
+            case '\r': ss << "\\r"; break;
+            case '\t': ss << "\\t"; break;
+            case '"': ss << "\\\""; break;
+            case '\\': ss << "\\\\"; break;
+            default:
+                if (c >= 0x20 && c <= 0x7e) {
+                    ss << c;
+                } else {
+                    ss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int)(unsigned char)c;
+                }
+                break;
+        }
+    }
+    return ss.str();
+}
 
 static bool __contains_ic(const char* text, const char* pat);
 static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB, int& opType);
@@ -2254,6 +2280,114 @@ int LogStoreApi::MaterializOutlier(BitMap* bitmap, int cnt, int refNum)
 		SyslogOut("%s\n", m_outliers[bitmap->GetIndex(i)]);
 	}
 }
+
+int LogStoreApi::Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, int matSize, std::string &json_out)
+{
+    int realSize = bitmapSize;
+    bool isFull = (bitmapSize == DEF_BITMAP_FULL);
+    
+    // 如果是全集，我们需要知道这个 Pattern 到底有多少条日志
+    if(isFull) {
+        // 这里暂时假设如果标记为 FULL，我们取 matSize 和一个合理上限的最小值
+        // 实际上应该从 Pattern 结构中获取该 pid 对应的总行数
+        // 为了安全起见，我们先支持物化请求的数量
+        realSize = matSize; 
+    }
+
+    int entryCnt = realSize >= matSize ? matSize : realSize;
+    if(entryCnt <= 0) return 0;
+
+    LogPattern* pat = m_patterns[pid]; 
+    if(!pat) return 0;
+
+    CELL* output = new CELL[pat->SegSize];
+    for(int i=0;i< pat->SegSize;i++)
+    {
+        if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
+        {
+            output[i] = pat->Segment[i];
+        }
+        else
+        {
+            output[i] = new char[MAX_VALUE_LEN * entryCnt];
+            memset(output[i], '\0', MAX_VALUE_LEN * entryCnt);
+            Materializ_Pats(pat->VarNames[i], bitmap, entryCnt, output[i]);
+        }
+    }
+    
+    for(int k=0; k < entryCnt; k++)
+    {
+        char* log_line = new char[MAX_LINE_SIZE];
+        memset(log_line, '\0', MAX_LINE_SIZE);
+        
+        for(int i=0;i< pat->SegSize;i++)
+        {
+            if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
+            {
+                strcat(log_line, output[i]);
+            }
+            else
+            {
+                strcat(log_line, output[i] + MAX_VALUE_LEN * k);
+            }
+        }
+        
+        std::string escaped_log = escape_json(std::string(log_line));
+        std::string escaped_template = escape_json(std::string(pat->Content));
+            
+            if(k > 0) json_out.append(",\n");
+            json_out.append("  {\n");
+        json_out.append("    \"log_line\": \""); json_out.append(escaped_log); json_out.append("\",\n");
+        char buf[64];
+        sprintf(buf, "    \"template_id\": %d,\n", pid); json_out.append(buf);
+                json_out.append("    \"template\": \""); json_out.append(escaped_template); json_out.append("\",\n");
+                
+                int lineNum = isFull ? (k + 1) : (bitmap->GetIndex(k) + 1);
+                sprintf(buf, "    \"line_number\": %d\n", lineNum); json_out.append(buf);
+                
+                json_out.append("  }");
+        
+        delete[] log_line;
+    }
+    
+    if(output)
+    {
+        for(int i=0;i< pat->SegSize;i++)
+        {
+            if(pat->SegAttr[i] != SEG_TYPE_CONST && pat->SegAttr[i] != SEG_TYPE_DELIM)
+            {
+                delete[] output[i];
+                output[i] = NULL;
+            }
+        }
+    }
+    delete[] output;
+    
+    return entryCnt;
+}
+
+int LogStoreApi::MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum, std::string &json_out)
+{
+    int doCnt = refNum > cnt ? cnt : refNum;
+    if(doCnt <= 0) return doCnt;
+    
+    for(int i=0; i < doCnt; i++)
+    {
+        std::string escaped_log = escape_json(std::string(m_outliers[bitmap->GetIndex(i)]));
+        
+        if(i > 0) json_out.append(",\n");
+        json_out.append("  {\n");
+        json_out.append("    \"log_line\": \""); json_out.append(escaped_log); json_out.append("\",\n");
+        json_out.append("    \"template_id\": -1,\n");
+        json_out.append("    \"template\": \"OUTLIER\",\n");
+        char buf[64];
+        sprintf(buf, "    \"line_number\": %d\n", bitmap->GetIndex(i) + 1); json_out.append(buf);
+        
+        json_out.append("  }");
+    }
+    
+    return doCnt;
+}
 ///////////////////Connect & Disconnect///////////////
 
 int LogStoreApi::IsConnect()
@@ -2632,6 +2766,10 @@ int LogStoreApi::SearchSingleInPattern(LogPattern* logPat, char *queryStr, short
 				Statistic.hit_at_mainpat_cnt++;
 				return bitmap->GetSize();
 			}
+			else
+			{
+				SyslogDebug("[SearchSingle] Mismatch at CONST: patSeg='%s', queryStr='%s'\n", logPat->Segment[i], queryStr);
+			}
 		}
 	}
 	for(int i=0; i< logPat->SegSize;i++)
@@ -2708,98 +2846,175 @@ int LogStoreApi::SearchMultiInPattern(LogPattern* logPat, char **querySegs, int 
 	int isMatched;
 	int iPos, j, maxI, segLen;
 	bitset<MAX_INPUT_TOKENSIZE> flag;//identity that if matched const segment, at least matched one (flag = 1)
+	int matchedPatternSegs[MAX_INPUT_TOKENSIZE];
 	int segSize = argCountE - argCountS + 1;
 	maxI = logPat->SegSize - segSize;// get the max comparing pos
 	for(int index=0; index<= maxI;index++)
 	{
+		memset(matchedPatternSegs, -1, sizeof(matchedPatternSegs));
 		iPos = index;
+		flag.reset();
 		for(j=0; j< segSize; j++)
 		{
-			//matched by delim
-			if(logPat->SegAttr[iPos] == SEG_TYPE_DELIM)//delim
+			// Try to match querySegs[j] against logPat->Segment[iPos...end]
+			while (iPos < logPat->SegSize)
 			{
-				if(querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[iPos][0])//delim
+				if (logPat->SegAttr[iPos] == SEG_TYPE_DELIM)
 				{
-					flag.set(j);
-					iPos++;
-				}
-				else
-				{
-					break;
-				}
-			}
-			else if(logPat->SegAttr[iPos] == SEG_TYPE_VAR)//var:<V1>...
-			{
-				if(querySegTags[j] == TAG_DELIM)
-				{
-					break;
-				}
-				else
-				{
-					iPos++;
-				}
-			}
-			else//const
-			{
-				if(querySegTags[j] == TAG_DELIM)
-				{
-					break;
-				}
-				else
-				{
-					//degraded to string matching 
-					segLen = strlen(logPat->Segment[iPos]);
-					int alignType = GetMatchedAlignType(segSize, j);
-					isMatched = SeqMatching(logPat->Segment[iPos], segLen, querySegs[j+ argCountS], querySegLens[j], alignType);
-					if(isMatched >= 0)//matched!
+					if (querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[iPos][0])
 					{
-						//queue from right to left, the first is the rightest
 						flag.set(j);
+						matchedPatternSegs[j] = iPos;
 						iPos++;
+						break; // Matched DELIM, move to next j
 					}
-					else//match failed!
+					else if (querySegTags[j] != TAG_DELIM)
 					{
-						break;
+						iPos++; // Skip DELIM in pattern
+						continue;
+					}
+					else { break; } // Query is DELIM but doesn't match this pattern DELIM
+				}
+				else if (logPat->SegAttr[iPos] == SEG_TYPE_VAR)
+				{
+					if (querySegTags[j] != TAG_DELIM)
+					{
+						// Check if current query segment matches any LATER CONST segment in the pattern
+						bool matchedLater = false;
+						for (int k = iPos + 1; k < logPat->SegSize; k++)
+						{
+							if (logPat->SegAttr[k] == SEG_TYPE_CONST)
+							{
+								int nextSegLen = strlen(logPat->Segment[k]);
+								int nextAlignType = GetMatchedAlignType(segSize, j);
+								if (SeqMatching(logPat->Segment[k], nextSegLen, querySegs[j + argCountS], querySegLens[j], nextAlignType) >= 0)
+								{
+									matchedLater = true;
+									break;
+								}
+							}
+							else if (logPat->SegAttr[k] == SEG_TYPE_VAR) {
+								// Keep going
+							}
+							else { // DELIM
+								if (querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[k][0]) {
+									matchedLater = true;
+									break;
+								}
+							}
+						}
+						
+						if (matchedLater)
+						{
+							iPos++; // Skip this VAR, try to match j later
+							continue;
+						}
+						else
+						{
+							// Check if j actually matches this VAR's dictionary
+							bool isValid = true;
+							int vName = logPat->VarNames[iPos];
+							if (m_subpatterns.count(vName) && m_subpatterns[vName]->DicCnt > 0)
+							{
+								char* tmpDicPtr = NULL;
+								int aType = GetMatchedAlignType(segSize, j);
+								if (GetDicIndexs(vName, querySegs[j + argCountS], aType, tmpDicPtr) <= 0)
+								{
+									isValid = false;
+								}
+								if (tmpDicPtr) delete[] tmpDicPtr;
+							}
+
+							if (isValid)
+							{
+								matchedPatternSegs[j] = iPos;
+								iPos++;
+								break; // Matched VAR (via pushdown later), move to next j
+							}
+							else
+							{
+								iPos++; // Not a valid value, skip this VAR
+								continue;
+							}
+						}
+					}
+					else
+					{
+						break; // Query is DELIM, cannot match VAR
+					}
+				}
+				else // SEG_TYPE_CONST
+				{
+					if (querySegTags[j] == TAG_DELIM)
+					{
+						break; // Mismatch
+					}
+					else
+					{
+						segLen = strlen(logPat->Segment[iPos]);
+						int alignType = GetMatchedAlignType(segSize, j);
+						isMatched = SeqMatching(logPat->Segment[iPos], segLen, querySegs[j + argCountS], querySegLens[j], alignType);
+						if (isMatched >= 0)
+						{
+							flag.set(j);
+							matchedPatternSegs[j] = iPos;
+							iPos++;
+							break; // Matched CONST, move to next j
+						}
+						else
+						{
+							break; // Mismatch
+						}
 					}
 				}
 			}
-		}
-		//total matched, record every pos, may matched multi results
-		if(j == segSize)
-		{
-			SyslogDebug("multiquery: i: %d\n", index);
-			if(flag.count() == segSize)
-			{//all matched in main pattern,return full matched
-				Statistic.hit_at_mainpat_cnt++;
-				bitmap->SetSize();
+			if (iPos > logPat->SegSize || (iPos == logPat->SegSize && j < segSize - 1)) {
+				// Failed to match all segments
+				j = -1; // Mark as failed
 				break;
 			}
-			m_glbExchgPatmap->Reset();
-			m_glbExchgPatmap->SetSize();
-			int queryType;
-			for(int flagIndex = 0; flagIndex < segSize; flagIndex++)
+			if (matchedPatternSegs[j] == -1)
 			{
-				if(flag[flagIndex] == 0 && m_glbExchgPatmap->GetSize() != 0)//pushdown to query vars
+				j = -1;
+				break;
+			}
+		}
+		
+		if (j == segSize) // Success!
+		{
+			SyslogDebug("---SearchMultiInPattern Success! Index: %d, Flag Count: %ld---\n", index, flag.count());
+			if(flag.count() == segSize)
+			{//all matched in main pattern,return full matched
+				bitmap->SetSize();
+				return bitmap->GetSize();
+			}
+			m_glbExchgPatmap->Reset();
+			int count=0;
+			for(int k = 0; k < segSize; k++)
+			{
+				if(flag[k] == 0)//pushdown to query vars
 				{
-					if(flagIndex == 0)//first seg matches the variable, then the remainings are right alighed
+					if (matchedPatternSegs[k] >= 0 && matchedPatternSegs[k] < logPat->SegSize)
 					{
-						queryType = QTYPE_ALIGN_RIGHT;
+						int alignType = GetMatchedAlignType(segSize, k);
+						SyslogDebug("---Pushing down to var: %d, Query: %s---\n", logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS]);
+						if(count == 0)
+						{
+							SearchInVar_Union(logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS], querySegTags[k], m_glbExchgPatmap);
+						}
+						else
+						{
+							SearchInVar_Pushdown(logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS], querySegTags[k], alignType, m_glbExchgPatmap);
+						}
+						count++;
 					}
-					else if(flagIndex == segSize-1)//last seg in var, then left aligned
-					{
-						queryType = QTYPE_ALIGN_LEFT;
-					}
-					else//the middles are must fully matched
-					{
-						queryType = QTYPE_ALIGN_FULL;
-					}
-					SyslogDebug("varname: %s %d %s\n", FormatVarName(logPat->VarNames[index + flagIndex]), queryType, logPat->Content);
-					SearchInVar_Pushdown(logPat->VarNames[index + flagIndex], querySegs[flagIndex + argCountS], querySegTags[flagIndex], queryType, m_glbExchgPatmap);
 				}
 			}
 			bitmap->Union(m_glbExchgPatmap);
 		}
-		flag.reset();
+	}
+	if (bitmap->GetSize() == 0) {
+		SyslogDebug("---SearchMultiInPattern Failed to find any matches---\n");
 	}
 	return bitmap->GetSize();
 }
@@ -2809,103 +3024,175 @@ int LogStoreApi::SearchMultiInPattern_RefMap(LogPattern* logPat, char **querySeg
 	int isMatched;
 	int iPos, j, maxI, segLen;
 	bitset<MAX_INPUT_TOKENSIZE> flag;//identity that if matched const segment, at least matched one (flag = 1)
+	int matchedPatternSegs[MAX_INPUT_TOKENSIZE];
 	int segSize = argCountE - argCountS + 1;
 	maxI = logPat->SegSize - segSize;// get the max comparing pos
 	for(int index=0; index<= maxI;index++)
 	{
+		memset(matchedPatternSegs, -1, sizeof(matchedPatternSegs));
 		iPos = index;
+		flag.reset();
 		for(j=0; j< segSize; j++)
 		{
-			//matched by delim
-			if(logPat->SegAttr[iPos] == SEG_TYPE_DELIM)//delim
+			// Try to match querySegs[j] against logPat->Segment[iPos...end]
+			while (iPos < logPat->SegSize)
 			{
-				if(querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[iPos][0])//delim
+				if (logPat->SegAttr[iPos] == SEG_TYPE_DELIM)
 				{
-					flag.set(j);
-					iPos++;
-				}
-				else
-				{
-					break;
-				}
-			}
-			else if(logPat->SegAttr[iPos] == SEG_TYPE_VAR)//var:<V1>...
-			{
-				if(querySegTags[j] == TAG_DELIM)
-				{
-					break;
-				}
-				else
-				{
-					iPos++;
-				}
-			}
-			else//const
-			{
-				if(querySegTags[j] == TAG_DELIM)
-				{
-					break;
-				}
-				else
-				{
-					segLen = strlen(logPat->Segment[iPos]);
-					int alignType = GetMatchedAlignType(segSize, j);
-					isMatched = SeqMatching(logPat->Segment[iPos], segLen, querySegs[j+ argCountS], querySegLens[j], alignType);
-					if(isMatched >= 0)//matched!
+					if (querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[iPos][0])
 					{
-						//queue from right to left, the first is the rightest
 						flag.set(j);
+						matchedPatternSegs[j] = iPos;
 						iPos++;
+						break; // Matched DELIM, move to next j
 					}
-					else//match failed!
+					else if (querySegTags[j] != TAG_DELIM)
 					{
-						break;
+						iPos++; // Skip DELIM in pattern
+						continue;
+					}
+					else { break; } // Query is DELIM but doesn't match this pattern DELIM
+				}
+				else if (logPat->SegAttr[iPos] == SEG_TYPE_VAR)
+				{
+					if (querySegTags[j] != TAG_DELIM)
+					{
+						// Check if current query segment matches any LATER CONST segment in the pattern
+						bool matchedLater = false;
+						for (int k = iPos + 1; k < logPat->SegSize; k++)
+						{
+							if (logPat->SegAttr[k] == SEG_TYPE_CONST)
+							{
+								int nextSegLen = strlen(logPat->Segment[k]);
+								int nextAlignType = GetMatchedAlignType(segSize, j);
+								if (SeqMatching(logPat->Segment[k], nextSegLen, querySegs[j + argCountS], querySegLens[j], nextAlignType) >= 0)
+								{
+									matchedLater = true;
+									break;
+								}
+							}
+							else if (logPat->SegAttr[k] == SEG_TYPE_VAR) {
+								// Keep going
+							}
+							else { // DELIM
+								if (querySegTags[j] == TAG_DELIM && querySegs[j + argCountS][0] == logPat->Segment[k][0]) {
+									matchedLater = true;
+									break;
+								}
+							}
+						}
+						
+						if (matchedLater)
+						{
+							iPos++; // Skip this VAR, try to match j later
+							continue;
+						}
+						else
+						{
+							// Check if j actually matches this VAR's dictionary
+							bool isValid = true;
+							int vName = logPat->VarNames[iPos];
+							if (m_subpatterns.count(vName) && m_subpatterns[vName]->DicCnt > 0)
+							{
+								char* tmpDicPtr = NULL;
+								int aType = GetMatchedAlignType(segSize, j);
+								if (GetDicIndexs(vName, querySegs[j + argCountS], aType, tmpDicPtr) <= 0)
+								{
+									isValid = false;
+								}
+								if (tmpDicPtr) delete[] tmpDicPtr;
+							}
+
+							if (isValid)
+							{
+								matchedPatternSegs[j] = iPos;
+								iPos++;
+								break; // Matched VAR (via pushdown later), move to next j
+							}
+							else
+							{
+								iPos++; // Not a valid value, skip this VAR
+								continue;
+							}
+						}
+					}
+					else
+					{
+						break; // Query is DELIM, cannot match VAR
 					}
 				}
+				else // SEG_TYPE_CONST
+				{
+					if (querySegTags[j] == TAG_DELIM)
+					{
+						break; // Mismatch
+					}
+					else
+					{
+						segLen = strlen(logPat->Segment[iPos]);
+						int alignType = GetMatchedAlignType(segSize, j);
+						isMatched = SeqMatching(logPat->Segment[iPos], segLen, querySegs[j + argCountS], querySegLens[j], alignType);
+						if (isMatched >= 0)
+						{
+							flag.set(j);
+							matchedPatternSegs[j] = iPos;
+							iPos++;
+							break; // Matched CONST, move to next j
+						}
+						else
+						{
+							break; // Mismatch
+						}
+					}
+				}
+			}
+			if (iPos > logPat->SegSize || (iPos == logPat->SegSize && j < segSize - 1)) {
+				// Failed to match all segments
+				j = -1; // Mark as failed
+				break;
+			}
+			if (matchedPatternSegs[j] == -1)
+			{
+				j = -1;
+				break;
 			}
 		}
-		//total matched, record every pos, may matched multi results
-		if(j == segSize)
+		
+		if (j == segSize) // Success!
 		{
-			SyslogDebug("multiquery: i: %d\n", index);
+			SyslogDebug("---SearchMultiInPattern_RefMap Success! Index: %d, Flag Count: %ld---\n", index, flag.count());
 			if(flag.count() == segSize)
 			{//all matched in main pattern,return full matched
 				bitmap->Union(refBitmap);
 				break;
 			}
 			m_glbExchgPatmap->Reset();
-			int queryType;
 			int count=0;
-			for(int flagIndex = 0; flagIndex < segSize; flagIndex++)
+			for(int k = 0; k < segSize; k++)
 			{
-				if(flag[flagIndex] == 0)//pushdown to query vars
+				if(flag[k] == 0)//pushdown to query vars
 				{
-					if(flagIndex == 0)
+					if (matchedPatternSegs[k] >= 0 && matchedPatternSegs[k] < logPat->SegSize)
 					{
-						queryType = QTYPE_ALIGN_RIGHT;
+						int queryType = GetMatchedAlignType(segSize, k);
+						SyslogDebug("---Pushing down to var (RefMap): %d, Query: %s---\n", logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS]);
+						if(count == 0)
+						{
+							SearchInVar_Pushdown_RefMap(logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS], querySegTags[k], queryType, m_glbExchgPatmap, refBitmap);
+						}
+						else
+						{
+							SearchInVar_Pushdown(logPat->VarNames[matchedPatternSegs[k]], querySegs[k + argCountS], querySegTags[k], queryType, m_glbExchgPatmap);
+						}
+						count++;
 					}
-					else if(flagIndex == segSize-1)
-					{
-						queryType = QTYPE_ALIGN_LEFT;
-					}
-					else
-					{
-						queryType = QTYPE_ALIGN_FULL;
-					}
-					if(count == 0)
-					{
-						SearchInVar_Pushdown_RefMap(logPat->VarNames[index + flagIndex], querySegs[flagIndex + argCountS], querySegTags[flagIndex], queryType, m_glbExchgPatmap, refBitmap);
-					}
-					else
-					{
-						SearchInVar_Pushdown(logPat->VarNames[index + flagIndex], querySegs[flagIndex + argCountS], querySegTags[flagIndex], queryType, m_glbExchgPatmap);
-					}
-					count++;
 				}
 			}
 			bitmap->Union(m_glbExchgPatmap);
 		}
-		flag.reset();
+	}
+	if (bitmap->GetSize() == 0) {
+		SyslogDebug("---SearchMultiInPattern_RefMap Failed to find any matches---\n");
 	}
 	return bitmap->GetSize();
 }
@@ -2913,6 +3200,7 @@ int LogStoreApi::SearchMultiInPattern_RefMap(LogPattern* logPat, char **querySeg
 //query A*B in one token
 int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char* queryStrB, short qATag, short qBTag, BitMap* bitmap)
 {
+    SyslogDebug("---Search_AxB_InPattern: A='%s', B='%s'---\n", queryStrA, queryStrB);
     int* badc_a; int* goods_a;
     int* badc_b; int* goods_b;
     InitBM(queryStrA, badc_a, goods_a);
@@ -2920,29 +3208,40 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
     int aLen = strlen(queryStrA);
     for(int i=0; i< logPat->SegSize; i++)
     {
+        if(logPat->SegAttr[i] == SEG_TYPE_DELIM)
+        {
+            if(qATag != SEG_TYPE_DELIM) continue;
+        }
         if(logPat->SegAttr[i] != SEG_TYPE_VAR)
         {
             int segLenA = strlen(logPat->Segment[i]);
             int posA = BM_Once(logPat->Segment[i], queryStrA, segLenA, badc_a, goods_a);
             if(posA >= 0)
             {
+                SyslogDebug("---A matched at Seg[%d]: '%s'---\n", i, logPat->Segment[i]);
                 int rem = segLenA - (posA + aLen);
                 if(rem > 0)
                 {
                     int posB = BM_Once(logPat->Segment[i] + posA + aLen, queryStrB, rem, badc_b, goods_b);
                     if(posB >= 0)
                     {
+                        SyslogDebug("---B matched in SAME Seg[%d]---\n", i);
                         bitmap->SetSize();
                         return bitmap->GetSize();
                     }
                 }
                 for(int j=i+1; j< logPat->SegSize; j++)
                 {
+                    if(logPat->SegAttr[j] == SEG_TYPE_DELIM)
+                    {
+                        if(qBTag != SEG_TYPE_DELIM) continue; // Skip DELIM when looking for B
+                    }
                     if(logPat->SegAttr[j] != SEG_TYPE_VAR)
                     {
                         int posB2 = BM_Once(logPat->Segment[j], queryStrB, strlen(logPat->Segment[j]), badc_b, goods_b);
                         if(posB2 >= 0)
                         {
+                            SyslogDebug("---B matched at LATER Seg[%d]: '%s'---\n", j, logPat->Segment[j]);
                             bitmap->SetSize();
                             return bitmap->GetSize();
                         }
@@ -2954,6 +3253,7 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
                         int rst = SearchInVar_Pushdown(logPat->VarNames[j], queryStrB, qBTag, QTYPE_ALIGN_ANY, m_glbExchgPatmap);
                         if(rst > 0 || m_glbExchgPatmap->BeSizeFul())
                         {
+                            SyslogDebug("---B matched at LATER VAR Seg[%d]: %d---\n", j, logPat->VarNames[j]);
                             bitmap->Union(m_glbExchgPatmap);
                             return bitmap->GetSize();
                         }
@@ -2967,6 +3267,7 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
             int rstAxB = SearchInVar_AxB_Union(logPat->VarNames[i], queryStrA, queryStrB, qATag, qBTag, m_glbExchgPatmap);
             if(rstAxB > 0 || m_glbExchgPatmap->BeSizeFul())
             {
+                SyslogDebug("---A*B matched in VAR Seg[%d]: %d---\n", i, logPat->VarNames[i]);
                 bitmap->Union(m_glbExchgPatmap);
                 return bitmap->GetSize();
             }
@@ -2975,13 +3276,19 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
             int rstA = SearchInVar_Pushdown(logPat->VarNames[i], queryStrA, qATag, QTYPE_ALIGN_ANY, m_glbExchgBitmap);
             if(rstA > 0 || m_glbExchgBitmap->BeSizeFul())
             {
+                SyslogDebug("---A matched in VAR Seg[%d]: %d, looking for B later---\n", i, logPat->VarNames[i]);
                 for(int j=i+1; j< logPat->SegSize; j++)
                 {
+                    if(logPat->SegAttr[j] == SEG_TYPE_DELIM)
+                    {
+                        if(qBTag != SEG_TYPE_DELIM) continue;
+                    }
                     if(logPat->SegAttr[j] != SEG_TYPE_VAR)
                     {
                         int posB3 = BM_Once(logPat->Segment[j], queryStrB, strlen(logPat->Segment[j]), badc_b, goods_b);
                         if(posB3 >= 0)
                         {
+                            SyslogDebug("---B matched at LATER Seg[%d]: '%s'---\n", j, logPat->Segment[j]);
                             bitmap->Union(m_glbExchgBitmap);
                             return bitmap->GetSize();
                         }
@@ -2993,6 +3300,7 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
                         int rstB = SearchInVar_Pushdown(logPat->VarNames[j], queryStrB, qBTag, QTYPE_ALIGN_ANY, m_glbExchgSubTempBitmap);
                         if(rstB > 0 || m_glbExchgSubTempBitmap->BeSizeFul())
                         {
+                            SyslogDebug("---B matched at LATER VAR Seg[%d]: %d---\n", j, logPat->VarNames[j]);
                             m_glbExchgSubTempBitmap->Inset(m_glbExchgBitmap);
                             bitmap->Union(m_glbExchgSubTempBitmap);
                             return bitmap->GetSize();
@@ -3004,9 +3312,129 @@ int LogStoreApi::Search_AxB_InPattern(LogPattern* logPat, char* queryStrA, char*
     }
     return bitmap->GetSize();
 }
-int LogStoreApi::Search_AxB_InPattern_Logic(LogPattern* logPat, char* queryStrA, char* queryStrB, BitMap* bitmap, BitMap* refBitmap)
+int LogStoreApi::Search_AxB_InPattern_RefMap(LogPattern* logPat, char* queryStrA, char* queryStrB, short qATag, short qBTag, BitMap* bitmap, BitMap* refBitmap)
 {
-	;
+    SyslogDebug("---Search_AxB_InPattern_RefMap: A='%s', B='%s'---\n", queryStrA, queryStrB);
+    int* badc_a; int* goods_a;
+    int* badc_b; int* goods_b;
+    InitBM(queryStrA, badc_a, goods_a);
+    InitBM(queryStrB, badc_b, goods_b);
+    int aLen = strlen(queryStrA);
+    for(int i=0; i< logPat->SegSize; i++)
+    {
+        if(logPat->SegAttr[i] == SEG_TYPE_DELIM)
+        {
+            if(qATag != SEG_TYPE_DELIM) continue;
+        }
+        if(logPat->SegAttr[i] != SEG_TYPE_VAR)
+        {
+            int segLenA = strlen(logPat->Segment[i]);
+            int posA = BM_Once(logPat->Segment[i], queryStrA, segLenA, badc_a, goods_a);
+            if(posA >= 0)
+            {
+                SyslogDebug("---A matched at Seg[%d]: '%s'---\n", i, logPat->Segment[i]);
+                int rem = segLenA - (posA + aLen);
+                if(rem > 0)
+                {
+                    int posB = BM_Once(logPat->Segment[i] + posA + aLen, queryStrB, rem, badc_b, goods_b);
+                    if(posB >= 0)
+                    {
+                        SyslogDebug("---B matched in SAME Seg[%d]---\n", i);
+                        bitmap->Union(refBitmap);
+                        return bitmap->GetSize();
+                    }
+                }
+                for(int j=i+1; j< logPat->SegSize; j++)
+                {
+                    if(logPat->SegAttr[j] == SEG_TYPE_DELIM)
+                    {
+                        if(qBTag != SEG_TYPE_DELIM) continue; // Skip DELIM when looking for B
+                    }
+                    if(logPat->SegAttr[j] != SEG_TYPE_VAR)
+                    {
+                        int posB2 = BM_Once(logPat->Segment[j], queryStrB, strlen(logPat->Segment[j]), badc_b, goods_b);
+                        if(posB2 >= 0)
+                        {
+                            SyslogDebug("---B matched at LATER Seg[%d]: '%s'---\n", j, logPat->Segment[j]);
+                            bitmap->Union(refBitmap);
+                            return bitmap->GetSize();
+                        }
+                    }
+                    else
+                    {
+                        m_glbExchgPatmap->Reset();
+                        m_glbExchgPatmap->SetSize();
+                        int rst = SearchInVar_Pushdown_RefMap(logPat->VarNames[j], queryStrB, qBTag, QTYPE_ALIGN_ANY, m_glbExchgPatmap, refBitmap);
+                        if(rst > 0)
+                        {
+                            SyslogDebug("---B matched at LATER VAR Seg[%d]: %d---\n", j, logPat->VarNames[j]);
+                            bitmap->Union(m_glbExchgPatmap);
+                            return bitmap->GetSize();
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            m_glbExchgPatmap->Reset();
+            // SearchInVar_AxB_Union doesn't have a RefMap version, so we use it and then intersect with refBitmap
+            int rstAxB = SearchInVar_AxB_Union(logPat->VarNames[i], queryStrA, queryStrB, qATag, qBTag, m_glbExchgPatmap);
+            if(rstAxB > 0 || m_glbExchgPatmap->BeSizeFul())
+            {
+                SyslogDebug("---A*B matched in VAR Seg[%d]: %d---\n", i, logPat->VarNames[i]);
+                if (m_glbExchgPatmap->BeSizeFul())
+                {
+                    bitmap->Union(refBitmap);
+                }
+                else
+                {
+                    m_glbExchgPatmap->Inset(refBitmap);
+                    bitmap->Union(m_glbExchgPatmap);
+                }
+                return bitmap->GetSize();
+            }
+            
+            m_glbExchgBitmap->Reset();
+            m_glbExchgBitmap->SetSize();
+            int rstA = SearchInVar_Pushdown_RefMap(logPat->VarNames[i], queryStrA, qATag, QTYPE_ALIGN_ANY, m_glbExchgBitmap, refBitmap);
+            if(rstA > 0)
+            {
+                SyslogDebug("---A matched in VAR Seg[%d]: %d, looking for B later---\n", i, logPat->VarNames[i]);
+                for(int j=i+1; j< logPat->SegSize; j++)
+                {
+                    if(logPat->SegAttr[j] == SEG_TYPE_DELIM)
+                    {
+                        if(qBTag != SEG_TYPE_DELIM) continue;
+                    }
+                    if(logPat->SegAttr[j] != SEG_TYPE_VAR)
+                    {
+                        int posB3 = BM_Once(logPat->Segment[j], queryStrB, strlen(logPat->Segment[j]), badc_b, goods_b);
+                        if(posB3 >= 0)
+                        {
+                            SyslogDebug("---B matched at LATER Seg[%d]: '%s'---\n", j, logPat->Segment[j]);
+                            bitmap->Union(m_glbExchgBitmap);
+                            return bitmap->GetSize();
+                        }
+                    }
+                    else
+                    {
+                        m_glbExchgSubTempBitmap->Reset();
+                        m_glbExchgSubTempBitmap->SetSize();
+                        // Important: here we must pushdown using m_glbExchgBitmap (logs where A matched) as refBitmap
+                        int rstB = SearchInVar_Pushdown_RefMap(logPat->VarNames[j], queryStrB, qBTag, QTYPE_ALIGN_ANY, m_glbExchgSubTempBitmap, m_glbExchgBitmap);
+                        if(rstB > 0)
+                        {
+                            SyslogDebug("---B matched at LATER VAR Seg[%d]: %d---\n", j, logPat->VarNames[j]);
+                            bitmap->Union(m_glbExchgSubTempBitmap);
+                            return bitmap->GetSize();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return bitmap->GetSize();
 }
 
 int LogStoreApi::Search_SingleSegment(char *querySeg, OUT LISTBITMAPS &bitmaps)
@@ -3330,7 +3758,7 @@ int LogStoreApi::SearchByLogic_not(char *args[MAX_CMD_ARG_COUNT], int argCountS,
 				}
 				else
 				{
-					//Search_AxB_InPattern_Logic(itor->second, wArray[0], wArray[1], rangeSize, range, bitmaps[itor->first]);
+					Search_AxB_InPattern_RefMap(itor->second, wArray[0], wArray[1], queryStrTag, queryStr2Tag, m_glbExchgLogicmap, bitmaps[itor->first]);
 				}
 				bitmaps[itor->first]->Complement(m_glbExchgLogicmap);
 				if(bitmaps[itor->first]->GetSize() == 0)
@@ -3380,9 +3808,13 @@ int LogStoreApi::SearchByLogic_not(char *args[MAX_CMD_ARG_COUNT], int argCountS,
 			{
 				GetOutliers_MultiToken(args, argCountS, argCountE, bitmaps[OUTL_PAT_NAME], true);
 			}
-			else//A*B
+			else if(mCount == 2)//A*B
 			{
-				;
+				string queryAxB(wArray[0]);
+				queryAxB += ".*";
+				queryAxB += wArray[1];
+				int lineCount = m_glbMeta[OUTL_PAT_NAME]->lines;
+				QueryInStrArray_CReg_RefMap(m_outliers, lineCount, queryAxB.c_str(), bitmaps[OUTL_PAT_NAME], bitmaps[OUTL_PAT_NAME]);
 			}
 			if(bitmaps[OUTL_PAT_NAME]->GetSize() == 0)
 			{
@@ -3402,9 +3834,13 @@ int LogStoreApi::SearchByLogic_not(char *args[MAX_CMD_ARG_COUNT], int argCountS,
 			{
 				GetOutliers_MultiToken(args, argCountS, argCountE, bitmap_outlier);
 			}
-			else//A*B
+			else if(mCount == 2)//A*B
 			{
-				;
+				string queryAxB(wArray[0]);
+				queryAxB += ".*";
+				queryAxB += wArray[1];
+				int lineCount = m_glbMeta[OUTL_PAT_NAME]->lines;
+				QueryInStrArray_CReg_RefMap(m_outliers, lineCount, queryAxB.c_str(), bitmaps[OUTL_PAT_NAME], bitmaps[OUTL_PAT_NAME]);
 			}
 			if(bitmap_outlier->BeSizeFul())
 			{
@@ -3596,9 +4032,13 @@ int LogStoreApi::SearchByLogic_norm(char *args[MAX_CMD_ARG_COUNT], int argCountS
 		{
 			GetOutliers_MultiToken(args, argCountS, argCountE, bitmap_outlier);
 		}
-		else//A*B
+		else if(mCount == 2)//A*B
 		{
-			;
+			string queryAxB(wArray[0]);
+			queryAxB += ".*";
+			queryAxB += wArray[1];
+			int lineCount = m_glbMeta[OUTL_PAT_NAME]->lines;
+			QueryInStrArray_CReg(m_outliers, lineCount, queryAxB.c_str(), bitmap_outlier);
 		}
 		if(bitmap_outlier->GetSize() == 0)
 		{
@@ -4320,14 +4760,84 @@ int LogStoreApi::SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT 
 
     Node* root = parse_expr();
 
-    auto build_full = [&](){ LISTBITMAPS full; for(LISTPATS::iterator it=m_patterns.begin(); it!=m_patterns.end(); ++it){ BitMap* bm = new BitMap(it->second->Count); bm->SetSize(); full[it->first]=bm; } return full; };
+    auto get_total_lines = [&](int pid) -> int {
+        if(pid == OUTL_PAT_NAME) {
+            if(m_glbMeta.count(OUTL_PAT_NAME)) return m_glbMeta[OUTL_PAT_NAME]->lines;
+            return 0;
+        }
+        if(m_patterns.count(pid)) return m_patterns[pid]->Count;
+        return 0;
+    };
+
+    auto build_full = [&](){ 
+        LISTBITMAPS full; 
+        for(auto& it : m_patterns){ 
+            BitMap* bm = new BitMap(it.second->Count); 
+            bm->SetSize(); 
+            full[it.first]=bm; 
+        } 
+        if(m_glbMeta.count(OUTL_PAT_NAME)) {
+            BitMap* bm = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
+            bm->SetSize();
+            full[OUTL_PAT_NAME] = bm;
+        }
+        return full; 
+    };
+
+    auto clear_bitmaps = [](LISTBITMAPS& bms) {
+        for(auto& kv : bms) { if(kv.second) delete kv.second; }
+        bms.clear();
+    };
+
     function<LISTBITMAPS(Node*)> eval = [&](Node* n)->LISTBITMAPS{
         LISTBITMAPS res;
         if(!n) return res;
-        if(n->t==0){ SearchByLogic_norm(aargs, n->s, n->e, res); return res; }
-        if(n->t==3){ LISTBITMAPS a = eval(n->u); LISTBITMAPS full = build_full(); for(LISTBITMAPS::iterator it=full.begin(); it!=full.end(); ++it){ LISTBITMAPS::iterator ia = a.find(it->first); if(ia!=a.end() && ia->second){ it->second->Complement(ia->second); } res[it->first]=it->second; } return res; }
-        if(n->t==1){ LISTBITMAPS a = eval(n->l); LISTBITMAPS b = eval(n->r); for(LISTBITMAPS::iterator it=a.begin(); it!=a.end(); ++it){ LISTBITMAPS::iterator ib = b.find(it->first); if(ib!=b.end() && ib->second && it->second){ BitMap* bm = new BitMap(m_patterns[it->first]->Count); bm->CloneFrom(it->second); bm->Inset(ib->second); res[it->first]=bm; } } return res; }
-        if(n->t==2){ LISTBITMAPS a = eval(n->l); LISTBITMAPS b = eval(n->r); res = a; for(LISTBITMAPS::iterator it=b.begin(); it!=b.end(); ++it){ if(res[it->first]){ res[it->first]->Union(it->second); } else { res[it->first]=it->second; } } return res; }
+        if(n->t==0){ 
+            SearchByLogic_norm(aargs, n->s, n->e, res); 
+            return res; 
+        }
+        if(n->t==3){ // NOT
+            LISTBITMAPS a = eval(n->u); 
+            LISTBITMAPS full = build_full(); 
+            for(auto& it : full){ 
+                auto ia = a.find(it.first); 
+                if(ia!=a.end() && ia->second){ it.second->Complement(ia->second); } 
+                res[it.first]=it.second; 
+            } 
+            clear_bitmaps(a);
+            return res; 
+        }
+        if(n->t==1){ // AND
+            LISTBITMAPS a = eval(n->l); 
+            LISTBITMAPS b = eval(n->r); 
+            for(auto& it : a){ 
+                auto ib = b.find(it.first); 
+                if(ib!=b.end() && ib->second && it.second){ 
+                    BitMap* bm = new BitMap(get_total_lines(it.first)); 
+                    bm->CloneFrom(it.second); 
+                    bm->Inset(ib->second); 
+                    res[it.first]=bm; 
+                } 
+            } 
+            clear_bitmaps(a);
+            clear_bitmaps(b);
+            return res; 
+        }
+        if(n->t==2){ // OR
+            LISTBITMAPS a = eval(n->l); 
+            LISTBITMAPS b = eval(n->r); 
+            res = a; 
+            for(auto& it : b){ 
+                if(res.count(it.first) && res[it.first]){ 
+                    res[it.first]->Union(it.second); 
+                    if(it.second) delete it.second;
+                } else { 
+                    res[it.first]=it.second; 
+                } 
+            } 
+            b.clear(); // pointers moved to res or deleted
+            return res; 
+        }
         return res;
     };
 
@@ -4420,13 +4930,28 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
 			//session
 			if(INC_TEST_SESSION)
 			{
-                m_sessions[fargs[0]] = bitmaps;
+                LISTBITMAPS cache_bitmaps;
+                for(auto& kv : bitmaps) {
+                    if(kv.second) {
+                        BitMap* clone = new BitMap(kv.second->TotalSize);
+                        clone->CloneFrom(kv.second);
+                        cache_bitmaps[kv.first] = clone;
+                    }
+                }
+                m_sessions[fargs[0]] = cache_bitmaps;
 			}
 		}
 		else
 		{
             timeval tt1 = ___StatTime_Start();
-            bitmaps = m_sessions[fargs[0]];
+            LISTBITMAPS& cached = m_sessions[fargs[0]];
+            for(auto& kv : cached) {
+                if(kv.second) {
+                    BitMap* clone = new BitMap(kv.second->TotalSize);
+                    clone->CloneFrom(kv.second);
+                    bitmaps[kv.first] = clone;
+                }
+            }
             RunStatus.SearchPatternTime = ___StatTime_End(tt1);
             RunStatus.SearchOutlierTime = 0;
             RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
@@ -4462,13 +4987,28 @@ int LogStoreApi::SearchByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCo
                 //session
                 if(INC_TEST_SESSION)
                 {
-                    m_sessions[queryStr] = bitmaps;
+                    LISTBITMAPS cache_bitmaps;
+                    for(auto& kv : bitmaps) {
+                        if(kv.second) {
+                            BitMap* clone = new BitMap(kv.second->TotalSize);
+                            clone->CloneFrom(kv.second);
+                            cache_bitmaps[kv.first] = clone;
+                        }
+                    }
+                    m_sessions[queryStr] = cache_bitmaps;
                 }
             }
             else
             {
                 timeval tt1 = ___StatTime_Start();
-                bitmaps = m_sessions[queryStr];
+                LISTBITMAPS& cached = m_sessions[queryStr];
+                for(auto& kv : cached) {
+                    if(kv.second) {
+                        BitMap* clone = new BitMap(kv.second->TotalSize);
+                        clone->CloneFrom(kv.second);
+                        bitmaps[kv.first] = clone;
+                    }
+                }
                 RunStatus.SearchPatternTime = ___StatTime_End(tt1);
                 RunStatus.SearchOutlierTime = 0;
                 RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
@@ -4597,20 +5137,16 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
         }
         fargs[fcount++] = args[i];
     }
+
     LISTBITMAPS bitmaps;
     int ret = 0;
     if(fcount == 1)
     {
-        timeval tt1 = ___StatTime_Start();
         Search_SingleSegment(fargs[0], bitmaps);
-        RunStatus.SearchPatternTime = ___StatTime_End(tt1);
-        timeval tt2 = ___StatTime_Start();
         BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
         bitmap_outlier->SetSize();
         GetOutliers_SinglToken(fargs[0], bitmap_outlier);
         bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
-        RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
-        RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
         ret = 1;
     }
     else
@@ -4618,78 +5154,17 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
         int flag = IsSearchWithLogic(fargs, fcount);
         if(flag == 0)
         {
-            char queryChars[MAX_PATTERN_SIZE]={'\0'};
-            RecombineString(fargs, 0, fcount-1, queryChars);
-            string queryStr(queryChars);
-            timeval tt1 = ___StatTime_Start();
             Search_MultiSegments(fargs, fcount, bitmaps);
-            RunStatus.SearchPatternTime = ___StatTime_End(tt1);
-            timeval tt2 = ___StatTime_Start();
             BitMap* bitmap_outlier = new BitMap(m_glbMeta[OUTL_PAT_NAME]->lines);
             bitmap_outlier->SetSize();
             GetOutliers_MultiToken(fargs, 0, fcount-1, bitmap_outlier);
             bitmaps[OUTL_PAT_NAME] = bitmap_outlier;
-            RunStatus.SearchOutlierTime = ___StatTime_End(tt2);
-            RunStatus.SearchTotalTime = RunStatus.SearchPatternTime + RunStatus.SearchOutlierTime;
             ret = 1;
         }
         else
         {
-            std::vector<std::string> ptoks; ptoks.reserve(fcount*2);
-            for(int i=0;i<fcount;i++){ const char* s=fargs[i]; if(!s) continue; int n=(int)strlen(s); std::string buf; buf.reserve(n); for(int j=0;j<n;j++){ char c=s[j]; if(c=='('||c==')'){ if(!buf.empty()){ ptoks.push_back(buf); buf.clear(); } } else { buf.push_back(c); } } if(!buf.empty()){ ptoks.push_back(buf); } }
-            std::vector<char*> cargs; cargs.reserve(ptoks.size()); for(size_t i=0;i<ptoks.size();i++){ cargs.push_back((char*)ptoks[i].c_str()); }
-            int ccount = (int)cargs.size();
-            bool has_and=false, has_or=false, has_not=false;
-            for(int i=0;i<ccount;i++){ if(stricmp(cargs[i], LOGIC_AND)==0) has_and=true; else if(stricmp(cargs[i], LOGIC_OR)==0 || stricmp(cargs[i], LOGIC_or)==0) has_or=true; else if(stricmp(cargs[i], LOGIC_NOT)==0) has_not=true; }
-            if(has_and && !has_or && !has_not)
-            {
-                int temp=0; LISTBITMAPS acc; bool first=true;
-                for(int i=0;i<ccount;i++)
-                {
-                    if(stricmp(cargs[i], LOGIC_AND)==0)
-                    {
-                        LISTBITMAPS part; SearchByLogic_norm((char**)cargs.data(), temp, i-1, part);
-                        if(first){ acc.swap(part); first=false; }
-                        else
-                        {
-                            for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
-                            {
-                                int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=part.find(pid); BitMap* nxt=(ip!=part.end())?ip->second:NULL;
-                                if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
-                                if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
-                                else if(nxt->BeSizeFul()){ delete nxt; }
-                                else { cur->Inset(nxt); delete nxt; }
-                            }
-                            for(LISTBITMAPS::iterator ip=part.begin(); ip!=part.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
-                        }
-                        temp = i+1;
-                    }
-                }
-                LISTBITMAPS last; SearchByLogic_norm((char**)cargs.data(), temp, ccount-1, last);
-                if(first){ acc.swap(last); }
-                else
-                {
-                    for(LISTBITMAPS::iterator it=acc.begin(); it!=acc.end(); ++it)
-                    {
-                        int pid=it->first; BitMap* cur=it->second; LISTBITMAPS::iterator ip=last.find(pid); BitMap* nxt=(ip!=last.end())?ip->second:NULL;
-                        if(!cur||!nxt){ if(cur) delete cur; it->second=NULL; continue; }
-                        if(cur->BeSizeFul()){ delete cur; it->second=nxt; }
-                        else if(nxt->BeSizeFul()){ delete nxt; }
-                        else { cur->Inset(nxt); delete nxt; }
-                    }
-                    for(LISTBITMAPS::iterator ip=last.begin(); ip!=last.end(); ++ip){ if(acc.find(ip->first)==acc.end()){ acc[ip->first]=NULL; if(ip->second) delete ip->second; } }
-                }
-                bitmaps.swap(acc);
-                RunStatus.SearchTotalTime = 0;
-                ret = 1;
-            }
-            else
-            {
-                timeval tt1 = ___StatTime_Start();
-                SearchByLogic(fargs, fcount, bitmaps);
-                RunStatus.SearchTotalTime = ___StatTime_End(tt1);
-                ret = 1;
-            }
+            SearchByLogic(fargs, fcount, bitmaps);
+            ret = 1;
         }
     }
     if(hasTime){ ApplyTimeFilterToBitmaps(bitmaps, tstart, tend); }
@@ -4699,100 +5174,37 @@ int LogStoreApi::SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int 
     json_out.append("[");
     bool firstItem = true;
 
-    LISTBITMAPS::iterator itor = bitmaps.begin();
-    for(; itor != bitmaps.end(); ++itor)
+    // Handle outliers first
+    if(bitmaps.count(OUTL_PAT_NAME) && bitmaps[OUTL_PAT_NAME] != NULL)
     {
+        BitMap* bitmap = bitmaps[OUTL_PAT_NAME];
+        int got = MaterializOutlier_JSON(bitmap, bitmap->GetSize(), matNum - totalCnt, json_out);
+        if(got > 0) firstItem = false;
+        totalCnt += got;
+        delete bitmap;
+        bitmaps.erase(OUTL_PAT_NAME);
+    }
+
+    // Handle patterns
+    for(LISTBITMAPS::iterator itor = bitmaps.begin(); itor != bitmaps.end(); ++itor)
+    {
+        if(totalCnt >= matNum) break;
         int pid = itor->first;
         BitMap* bitmap = itor->second;
         if(bitmap == NULL) continue;
-        int entryCnt = bitmap->BeSizeFul() ? (pid==OUTL_PAT_NAME? bitmap->GetSize() : m_patterns[pid]->Count) : bitmap->GetSize();
-        int doCnt = entryCnt >= (matNum - totalCnt) ? (matNum - totalCnt) : entryCnt;
-        if(doCnt <= 0) { delete bitmap; continue; }
-
-        if(pid == OUTL_PAT_NAME)
+        
+        if(!firstItem && totalCnt < matNum && bitmap->GetSize() > 0)
         {
-            for(int i=0;i<doCnt;i++)
-            {
-                int idx = bitmap->GetIndex(i);
-                        if (idx == -1) continue;
-                const char* line = m_outliers[idx];
-                if(!firstItem) json_out.append(",");
-                firstItem = false;
-                char buf[64];
-                snprintf(buf, sizeof(buf), "%d", idx+1);
-                json_out.append("{\"log_line\":\"");
-                // naive escape
-                for(const char* p=line; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else if(*p=='\n' || *p=='\r'){ } else { json_out.push_back(*p);} }
-                json_out.append("\",\"template_id\":-1,\"template\":\"OUTLIER\",\"line_number\":");
-                json_out.append(buf);
-                json_out.append("}");
-                totalCnt++;
-                if(totalCnt >= matNum) break;
-            }
+            json_out.append(",");
         }
-        else
-                {
-                    LogPattern* pat = m_patterns[pid];
-                    if (pat == NULL) { delete bitmap; continue; }
-            CELL* output = new CELL[pat->SegSize];
-            for(int i=0;i< pat->SegSize;i++)
-            {
-                if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
-                {
-                    output[i] = pat->Segment[i];
-                }
-                else
-                {
-                    output[i] = new char[MAX_VALUE_LEN * doCnt];
-                    memset(output[i], '\0', MAX_VALUE_LEN * doCnt);
-                    Materializ_Pats(pat->VarNames[i], bitmap, doCnt, output[i]);
-                }
-            }
-            for(int k=0;k<doCnt;k++)
-            {
-                if(!firstItem) json_out.append(",");
-                firstItem = false;
-                json_out.append("{\"log_line\":\"");
-                char linebuf[MAX_LINE_SIZE];
-                memset(linebuf, '\0', MAX_LINE_SIZE);
-                for(int i=0;i< pat->SegSize;i++)
-                {
-                    if(pat->SegAttr[i] == SEG_TYPE_CONST || pat->SegAttr[i] == SEG_TYPE_DELIM)
-                    {
-                        strncat(linebuf, output[i], MAX_LINE_SIZE - strlen(linebuf) -1);
-                    }
-                    else
-                    {
-                        strncat(linebuf, output[i] + MAX_VALUE_LEN * k, MAX_LINE_SIZE - strlen(linebuf) -1);
-                    }
-                }
-                for(const char* p=linebuf; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else if(*p=='\n' || *p=='\r'){ } else { json_out.push_back(*p);} }
-                char bufIdx[64]; snprintf(bufIdx, sizeof(bufIdx), "%d", bitmap->GetIndex(k)+1);
-                json_out.append("\",\"template_id\":");
-                char bufPid[64]; snprintf(bufPid, sizeof(bufPid), "%d", pid);
-                json_out.append(bufPid);
-                json_out.append(",\"template\":\"");
-                for(const char* p=pat->Content; *p; ++p){ if(*p=='"' || *p=='\\') { json_out.push_back('\\'); json_out.push_back(*p);} else { json_out.push_back(*p);} }
-                json_out.append("\",\"line_number\":");
-                json_out.append(bufIdx);
-                json_out.append("}");
-                totalCnt++;
-                if(totalCnt >= matNum) break;
-            }
-            for(int i=0;i< pat->SegSize;i++)
-            {
-                if(pat->SegAttr[i] != SEG_TYPE_CONST && pat->SegAttr[i] != SEG_TYPE_DELIM)
-                {
-                    delete[] output[i];
-                    output[i] = NULL;
-                }
-            }
-            delete[] output;
-        }
+
+        int got = Materialization_JSON(pid, bitmap, bitmap->GetSize(), matNum - totalCnt, json_out);
+        if(got > 0) firstItem = false;
+        totalCnt += got;
         delete bitmap;
-        if(totalCnt >= matNum) break;
     }
     json_out.append("]");
+    bitmaps.clear();
     return totalCnt;
 }
 
@@ -4966,8 +5378,6 @@ int LogStoreApi::BuildBitmapsForQuery(char *args[MAX_CMD_ARG_COUNT], int argCoun
         }
     }
     if(hasTime){ ApplyTimeFilterToBitmaps(bitmaps, tstart, tend); }
-    LISTBITMAPS::iterator it = bitmaps.find(OUTL_PAT_NAME);
-    if(it != bitmaps.end()){ delete it->second; bitmaps.erase(it); }
     return ret;
 }
 
@@ -5007,21 +5417,40 @@ static int __read_line_str(Coffer* meta, int index, char* buf, int buflen){
 
 int LogStoreApi::Timechart_Count_BySpan_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, const std::string& groupAlias, std::map<std::string, std::map<long long,int> >& gmap)
 {
-    gmap.clear(); if(span_ms<=0) return 0; LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); if(r<=0){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    gmap.clear(); if(span_ms<=0) return 0; 
+    bool isEmpty = (argCount == 1 && (args[0] == NULL || args[0][0] == '\0'));
+    LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); 
+    if(r<=0 && !isEmpty){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
     if(m_timeValues.empty()){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
     VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> vids=mgr->getVarIds(groupAlias);
     for(size_t gi=0; gi<vids.size(); gi++){
         int gvar = vids[gi]; int pid = (gvar & 0xFFFF0000);
         LISTBITMAPS::iterator ib = bitmaps.find(pid);
-        BitMap* filter = (ib!=bitmaps.end())? ib->second : NULL; if(!filter) continue;
+        BitMap* filter = NULL;
+        if(ib == bitmaps.end()){
+            if(isEmpty) filter = NULL;
+            else continue;
+        } else {
+            filter = ib->second;
+            if(!isEmpty && filter == NULL) continue;
+        }
         Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
-        int n = filter->GetSize(); char buf[1024];
-        for(int i=0;i<n;i++){
-            int idx = filter->GetIndex(i);
-            if(idx<0 || (size_t)idx>=m_timeValues.size()) continue;
-            long long v = m_timeValues[idx]; long long b = (v / span_ms) * span_ms;
-            int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-            gmap[key][b] += 1;
+        if(filter == NULL){
+            int n = (int)m_timeValues.size(); char buf[1024];
+            for(int i=0;i<n;i++){
+                long long v = m_timeValues[i]; long long b = (v / span_ms) * span_ms;
+                int glen = __read_line_str(meta, i, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+                gmap[key][b] += 1;
+            }
+        } else {
+            int n = filter->GetSize(); char buf[1024];
+            for(int i=0;i<n;i++){
+                int idx = filter->GetIndex(i);
+                if(idx<0 || (size_t)idx>=m_timeValues.size()) continue;
+                long long v = m_timeValues[idx]; long long b = (v / span_ms) * span_ms;
+                int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+                gmap[key][b] += 1;
+            }
         }
     }
     for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; }
@@ -5031,22 +5460,39 @@ int LogStoreApi::Timechart_Count_BySpan_Group(char *args[MAX_CMD_ARG_COUNT], int
 int LogStoreApi::Timechart_Count_ByBins_Group(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, const std::string& groupAlias, std::map<std::string, std::vector<int> >& gout)
 {
     gout.clear(); if(bins<=0) return 0; if(end_ms<=start_ms) return 0; long long width=(end_ms-start_ms)/bins; if(width<=0) width=1;
-    LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); if(r<=0){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
+    bool isEmpty = (argCount == 1 && (args[0] == NULL || args[0][0] == '\0'));
+    LISTBITMAPS bitmaps; int r=BuildBitmapsForQuery(args, argCount, bitmaps); 
+    if(r<=0 && !isEmpty){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
     if(m_timeValues.empty()){ for(auto &kv: bitmaps){ if(kv.second) delete kv.second; } return 0; }
     VarAliasManager* mgr=VarAliasManager::getInstance(); std::vector<int> vids=mgr->getVarIds(groupAlias);
     for(size_t gi=0; gi<vids.size(); gi++){
         int gvar = vids[gi]; int pid = (gvar & 0xFFFF0000);
         LISTBITMAPS::iterator ib = bitmaps.find(pid);
-        BitMap* filter = (ib!=bitmaps.end())? ib->second : NULL; if(!filter) continue;
+        BitMap* filter = NULL;
+        if(ib == bitmaps.end()){
+            if(isEmpty) filter = NULL;
+            else continue;
+        } else {
+            filter = ib->second;
+            if(!isEmpty && filter == NULL) continue;
+        }
         Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
-        std::vector<int>& counts = gout[std::string()]; // will move to key-specific after read
-        // we cannot pre-create for unknown keys; handle per-entry
-        int n = filter->GetSize(); char buf[1024];
-        for(int i=0;i<n;i++){
-            int idx = filter->GetIndex(i);
-            if(idx<0 || (size_t)idx>=m_timeValues.size()) continue; long long v=m_timeValues[idx]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
-            int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-            std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+        
+        if(filter == NULL){
+            int n = (int)m_timeValues.size(); char buf[1024];
+            for(int i=0;i<n;i++){
+                long long v=m_timeValues[i]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
+                int glen = __read_line_str(meta, i, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+                std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+            }
+        } else {
+            int n = filter->GetSize(); char buf[1024];
+            for(int i=0;i<n;i++){
+                int idx = filter->GetIndex(i);
+                if(idx<0 || (size_t)idx>=m_timeValues.size()) continue; long long v=m_timeValues[idx]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
+                int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
+                std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+            }
         }
     }
     for(LISTBITMAPS::iterator it=bitmaps.begin(); it!=bitmaps.end(); ++it){ if(it->second) delete it->second; }

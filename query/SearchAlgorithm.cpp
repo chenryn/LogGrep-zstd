@@ -245,13 +245,23 @@ int RecombineString(char* args[], int argCountS, int argCountE, char* queryStr)
 	for(int i=argCountS; i<= argCountE; i++)
 	{
 		int argLen = strlen(args[i]);
-		if (offset + argLen < MAX_PATTERN_SIZE - 1) {
+		if (offset + argLen + (i > argCountS ? 1 : 0) < MAX_PATTERN_SIZE - 1) {
+			if (i > argCountS) {
+				queryStr[offset++] = ' ';
+			}
 			memcpy(queryStr + offset, args[i], argLen);
 			offset += argLen;
 		} else {
 			// Handle potential overflow: truncate the string
-			memcpy(queryStr + offset, args[i], MAX_PATTERN_SIZE - 1 - offset);
-			offset = MAX_PATTERN_SIZE - 1;
+			int remain = MAX_PATTERN_SIZE - 1 - offset;
+			if (i > argCountS && remain > 0) {
+				queryStr[offset++] = ' ';
+				remain--;
+			}
+			if (remain > 0) {
+				memcpy(queryStr + offset, args[i], (argLen < remain ? argLen : remain));
+				offset += (argLen < remain ? argLen : remain);
+			}
 			break;
 		}
 	}
@@ -1128,13 +1138,16 @@ int BM_Diff_Pushdown_RefMap(char* text, int sLen, const char* pattern, BitMap* b
 int GetCvarsByBitmap_Fixed(char* text, int lineLen, BitMap* bitmap, OUT char *vars, int entryCnt, int varsLineLen, bool flag)
 {
 	int bitmapSize = bitmap->GetSize();
-	if(bitmapSize <= 0) return 0;
+	if(bitmapSize == 0) return 0;
+	// 如果是全集，虽然 GetSize() 返回 DEF_BITMAP_FULL (-99)，但我们仍然需要处理数据
+	if(bitmapSize < 0 && bitmapSize != DEF_BITMAP_FULL) return 0;
 	int offsetT, offsetV;
 	if(flag)
 	{
 		for(int i=0;i< entryCnt;i++)
 		{
-			offsetT = bitmap->GetIndex(i) * lineLen;
+			int lineIdx = (bitmapSize == DEF_BITMAP_FULL) ? i : bitmap->GetIndex(i);
+			offsetT = lineIdx * lineLen;
 			offsetV = i * varsLineLen;
 			RemovePadding(text + offsetT, lineLen, vars + offsetV);
 		}
@@ -1143,7 +1156,8 @@ int GetCvarsByBitmap_Fixed(char* text, int lineLen, BitMap* bitmap, OUT char *va
 	{
 		for(int i=0;i< entryCnt;i++)
 		{
-			offsetT = bitmap->GetIndex(i) * lineLen;
+			int lineIdx = (bitmapSize == DEF_BITMAP_FULL) ? i : bitmap->GetIndex(i);
+			offsetT = lineIdx * lineLen;
 			offsetV = i * varsLineLen;
 			offsetV += strlen(vars + offsetV);
 			RemovePadding(text + offsetT, lineLen, vars + offsetV);
@@ -1183,6 +1197,11 @@ int GetCvars_Fixed(char* text, int lineLen, int lineCnt, OUT char *vars, int var
 int GetCvarsByBitmap_Diff(char* text, int sLen, int minLineLen, BitMap* bitmap, OUT char *vars, int entryCnt, int varsLineLen, bool flag)
 {
 	int bitmapSize = bitmap->GetSize();
+	if(bitmapSize == 0) return 0;
+	if(bitmapSize == DEF_BITMAP_FULL)
+	{
+		return GetCvars_Diff(text, sLen, vars, entryCnt, varsLineLen, flag);
+	}
 	int index=0; int offset=0; int lineIdx = 0;
 	char* p= text;int offsetV;
 	while (*p && p- text< sLen)

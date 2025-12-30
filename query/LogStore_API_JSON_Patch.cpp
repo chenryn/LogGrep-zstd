@@ -116,13 +116,14 @@ int LogStoreApi::MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum)
     
     for(int i=0; i < doCnt; i++)
     {
-        std::string escaped_log = escape_json(std::string(m_outliers[bitmap->GetIndex(i)]));
+        int line_idx = (bitmap->GetSize() == DEF_BITMAP_FULL) ? i : bitmap->GetIndex(i);
+        std::string escaped_log = escape_json(std::string(m_outliers[line_idx]));
         
         printf("  {\n");
         printf("    \"log_line\": \"%s\",\n", escaped_log.c_str());
         printf("    \"template_id\": -1,\n");
         printf("    \"template\": \"OUTLIER\",\n");
-        printf("    \"line_number\": %d\n", bitmap->GetIndex(i) + 1);
+        printf("    \"line_number\": %d\n", line_idx + 1);
         
         if(i < doCnt - 1)
             printf("  },\n");

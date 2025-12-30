@@ -80,6 +80,7 @@ graph TD
 *   `LOGGREP_FLUSH_RECORDS`: 日志写入后按记录条数自动刷盘，默认 50000 (条)。
 *   `LOGGREP_FLUSH_INTERVAL_MS`: 日志写入后自动刷盘间隔，默认 3000 (毫秒)。
 *   `LOGGREP_WAL_FSYNC`: 是否启用 WAL 同步刷盘，默认 0 (关闭)。
+*   `LOGGREP_MAX_BODY_BYTES`: 单次上传数据最大上限，默认 256 (MB)。
 
 ## API 文档
 
@@ -193,6 +194,13 @@ graph TD
     *   `index` (string, **必需**): 索引名称。
     *   `path` (string, 可选): 索引对应的存储路径。如果提供，则添加或更新索引。
     *   `delete` (string, 可选): 如果存在且非空，则删除指定索引。
+    *   索引级设置 (可选): 当提供以下任一参数时，服务器会在该索引目录生成 `ingest.conf` 并持久化，用于覆盖默认刷新策略：
+        *   `flush_bytes` (string): 如 `64m`、`1g`
+        *   `flush_records` (int): 触发刷新所需记录数，如 `50000`
+        *   `flush_interval_ms` (int): 定时刷新间隔，毫秒
+        *   `max_segments` (int): 每索引保留段的最大数量
+        *   `max_disk_bytes` (string): 段占用磁盘的最大总量，如 `5g`
+        *   `wal_fsync` (int): 是否对 WAL 执行 `fsync`，`1` 开启
 *   **响应**:
     ```json
     {
@@ -207,6 +215,17 @@ graph TD
          -H "Content-Type: application/x-www-form-urlencoded" \
          --data-urlencode "index=new_logs" \
          --data-urlencode "path=/var/loggrep/new_logs_data"
+    ```
+
+    **添加索引并设置刷新策略**:
+    ```bash
+    curl -X POST "http://localhost:8080/indices" \
+         -H "Content-Type: application/x-www-form-urlencoded" \
+         --data-urlencode "index=access" \
+         --data-urlencode "path=./ingest_example/access" \
+         --data-urlencode "flush_records=1" \
+         --data-urlencode "flush_interval_ms=0" \
+         --data-urlencode "wal_fsync=1"
     ```
 
     **删除索引**:

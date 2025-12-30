@@ -164,7 +164,7 @@ private:
 	
 	int IsSearchWithLogic(char *args[MAX_CMD_ARG_COUNT], int argCount);
 	int SearchSingleInPattern_RefMap(LogPattern* logPat, char *querySeg, short querySegTag, BitMap* bitmap, BitMap* refBitmap);
-	int Search_AxB_InPattern_Logic(LogPattern* logPat, char* queryStrA, char* queryStrB, BitMap* bitmap, BitMap* refBitmap);
+	int Search_AxB_InPattern_RefMap(LogPattern* logPat, char* queryStrA, char* queryStrB, short qATag, short qBTag, BitMap* bitmap, BitMap* refBitmap);
 	int SearchMultiInPattern_RefMap(LogPattern* logPat, char **querySegs, int argCountS, int argCountE, short* querySegTags, int* querySegLens, BitMap* bitmap, BitMap* refBitmap);
 	int SearchByLogic(char *args[MAX_CMD_ARG_COUNT], int argCount, OUT LISTBITMAPS& bitmaps);
 	int SearchByLogic_OR(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, OUT LISTBITMAPS& bitmap);
@@ -176,11 +176,13 @@ private:
 
 	int RebuiltData_Subpat(char* data, int entryLen, int index, int no, int outfilename, string constStr, OUT char* vars);
 	int Materialization(int pid, BitMap* bitmap, int bitmapSize, int matSize);
+	int Materialization_JSON(int pid, BitMap* bitmap, int bitmapSize, int matSize, std::string &json_out);
 	int Materializ_Pats(int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 	int Materializ_Subpat(SubPattern* subpat, int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 	int Materializ_Dic(int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 	int Materializ_Var(int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 	int MaterializOutlier(BitMap* bitmap, int cnt, int refNum);
+	int MaterializOutlier_JSON(BitMap* bitmap, int cnt, int refNum, std::string &json_out);
 	int Materializ_Dic_Kmp(int varname, BitMap* bitmap, int entryCnt, OUT char* vars);
 
 public:

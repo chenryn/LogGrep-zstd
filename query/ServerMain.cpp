@@ -1,8 +1,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <csignal>
 #include <string>
 #include <map>
 #include <vector>
@@ -21,22 +23,45 @@
 #include <queue>
 #include <atomic>
 #include <dirent.h>
+#include <sys/stat.h>
 extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path);
+int main_while_flag = 1;
+int thread_while_flag = 1;
 static void recover_wal_dir(const std::string& dir);
 
 static std::map<std::string,std::string> g_index_map;
 static std::string g_index_cfg = std::string("indices.conf");
+static std::string g_server_cfg = std::string("server.conf");
+static std::string g_data_root;
 static std::map<std::string, RollingWriter*> g_writers;
 static std::mutex g_writers_mtx;
 static std::atomic<int> g_pending_count{0};
+static int g_worker_count = 0;
+static int g_max_pending_global = 4096;
 static void load_indices(){ std::ifstream in(g_index_cfg.c_str()); if(in.good()){ g_index_map.clear(); std::string line; while(std::getline(in, line)){ size_t eq=line.find('='); if(eq==std::string::npos) continue; std::string k=line.substr(0,eq); std::string v=line.substr(eq+1); if(!k.empty() && !v.empty()){ g_index_map[k]=v; } } in.close(); }
   if(g_index_map.empty()){ g_index_map["main"]=std::string("../lib_output_zip/Ssh"); g_index_map["ssh"]=std::string("../lib_output_zip/Ssh"); std::ofstream out(g_index_cfg.c_str(), std::ios::out|std::ios::trunc); if(out.good()){ for(auto &it: g_index_map){ out<<it.first<<"="<<it.second<<"\n"; } out.close(); } }
 }
+
+static void load_server_config(){ std::ifstream in(g_server_cfg.c_str()); if(!in.good()) return; std::string line; while(std::getline(in, line)){ size_t eq=line.find('='); if(eq==std::string::npos) continue; std::string k=line.substr(0,eq); std::string v=line.substr(eq+1); if(k=="indices_cfg"){ if(!v.empty()) g_index_cfg=v; }
+    else if(k=="data_root"){ if(!v.empty()) g_data_root=v; } }
+  in.close(); }
+
+static std::string join_path2(const std::string& a, const std::string& b){ if(a.empty()) return b; if(a.back()=='/') return a + b; return a + std::string("/") + b; }
+static void ensure_dir2(const std::string& p){ if(p.empty()) return; size_t i=0; if(p[0]=='/') i=1; while(true){ size_t pos=p.find('/', i); std::string sub=p.substr(0, pos==std::string::npos? p.size(): pos); if(!sub.empty()){ struct stat st; if(stat(sub.c_str(), &st)!=0){ mkdir(sub.c_str(), 0755); } }
+    if(pos==std::string::npos) break; i=pos+1; } }
+static void write_index_settings_conf(const std::string& dir, const std::map<std::string,std::string>& kv){ auto getv=[&](const char* k){ auto it=kv.find(std::string(k)); if(it!=kv.end()) return it->second; return std::string(); }; auto getvl=[&](const char* k){ std::string kk(k); for(size_t i=0;i<kk.size();i++){ char c=kk[i]; if(c>='A'&&c<='Z') kk[i]=c-'A'+'a'; }
+    for(auto &it: kv){ std::string key=it.first; for(size_t i=0;i<key.size();i++){ char c=key[i]; if(c>='A'&&c<='Z') key[i]=c-'A'+'a'; }
+    if(key==kk) return it.second; } return std::string(); };
+  std::string fb = getvl("flush_bytes"); std::string fr = getvl("flush_records"); std::string fi = getvl("flush_interval_ms"); std::string ms = getvl("max_segments"); std::string md = getvl("max_disk_bytes"); std::string wf = getvl("wal_fsync"); bool any = (!fb.empty()||!fr.empty()||!fi.empty()||!ms.empty()||!md.empty()||!wf.empty()); if(!any) return; ensure_dir2(dir); std::string cfg = join_path2(dir, std::string("ingest.conf")); std::ofstream out(cfg.c_str(), std::ios::out|std::ios::trunc); if(!out.good()) return; if(!fb.empty()) out<<"FLUSH_BYTES="<<fb<<"\n"; if(!fr.empty()) out<<"FLUSH_RECORDS="<<fr<<"\n"; if(!fi.empty()) out<<"FLUSH_INTERVAL_MS="<<fi<<"\n"; if(!ms.empty()) out<<"MAX_SEGMENTS="<<ms<<"\n"; if(!md.empty()) out<<"MAX_DISK_BYTES="<<md<<"\n"; if(!wf.empty()) out<<"WAL_FSYNC="<<wf<<"\n"; out.close(); }
 static void save_indices(){ std::ofstream out(g_index_cfg.c_str(), std::ios::out|std::ios::trunc); if(out.good()){ for(auto &it: g_index_map){ out<<it.first<<"="<<it.second<<"\n"; } out.close(); } }
 static RollingWriter* get_writer(const std::string& index){ std::lock_guard<std::mutex> lk(g_writers_mtx); auto it=g_index_map.find(index); if(it==g_index_map.end()) return nullptr; auto wit=g_writers.find(index); if(wit!=g_writers.end()) return wit->second; RollingWriter* w=new RollingWriter(it->second); g_writers[index]=w; return w; }
 
 static void write_all(int fd, const char* buf, size_t len){ size_t off=0; while(off<len){ ssize_t n=::write(fd, buf+off, len-off); if(n<=0) return; off+=n; } }
-static std::string read_headers(int fd){ std::string s; s.reserve(1024); char c; int state=0; while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0) break; s.push_back(c); if(state==0 && c=='\r') state=1; else if(state==1 && c=='\n') state=2; else if(state==2 && c=='\r') state=3; else if(state==3 && c=='\n') break; else state=0; } return s; }
+static size_t parse_size_bytes(const char* v){ if(!v||!*v) return 0; while(*v==' '||*v=='\t') v++; const char* p=v; while((*p>='0'&&*p<='9')||*p=='.') p++; double num=strtod(v,nullptr); size_t mult=1; std::string suf(p); for(size_t i=0;i<suf.size();i++){ char c=suf[i]; if(c>='A'&&c<='Z') suf[i]=c-'A'+'a'; } if(!suf.empty()){ if(suf[0]=='k') mult=1024ULL; else if(suf[0]=='m') mult=1024ULL*1024ULL; else if(suf[0]=='g') mult=1024ULL*1024ULL*1024ULL; } double val=num*(double)mult; if(val<=0.0) return 0; return (size_t)val; }
+static size_t get_max_header_bytes(){ static size_t v=0; if(v==0){ const char* s=getenv("LOGGREP_MAX_HEADER_BYTES"); v = s? parse_size_bytes(s) : (size_t)(64*1024); if(v==0) v=(size_t)(64*1024); } return v; }
+static size_t get_max_body_bytes(){ static size_t v=0; if(v==0){ const char* s=getenv("LOGGREP_MAX_BODY_BYTES"); v = s? parse_size_bytes(s) : (size_t)(256*1024*1024); if(v==0) v=(size_t)(256*1024*1024); } return v; }
+static void set_client_socket_options(int fd){ int on=1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)); setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)); const char* rv=getenv("LOGGREP_READ_TIMEOUT_MS"); const char* sv=getenv("LOGGREP_WRITE_TIMEOUT_MS"); int rtm=rv? atoi(rv): 5000; int wtm=sv? atoi(sv): 5000; if(rtm<0) rtm=0; if(wtm<0) wtm=0; struct timeval rto{ rtm/1000, (rtm%1000)*1000 }; struct timeval wto{ wtm/1000, (wtm%1000)*1000 }; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wto, sizeof(wto)); }
+static std::string read_headers(int fd){ std::string s; s.reserve(1024); char c; int state=0; size_t maxh=get_max_header_bytes(); while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0) break; s.push_back(c); if(s.size()>maxh){ s.clear(); break; } if(state==0 && c=='\r') state=1; else if(state==1 && c=='\n') state=2; else if(state==2 && c=='\r') state=3; else if(state==3 && c=='\n') break; else state=0; } return s; }
 static size_t find_content_length(const std::string& hdr){ size_t hpos=hdr.find("Content-Length:"); if(hpos==std::string::npos) return 0; size_t eol=hdr.find("\r\n", hpos); std::string v=hdr.substr(hpos+15, eol-(hpos+15)); return strtoul(v.c_str(), nullptr, 10); }
 static bool has_chunked(const std::string& hdr){ size_t p=hdr.find("Transfer-Encoding:"); if(p==std::string::npos) return false; size_t e=hdr.find("\r\n", p); std::string v=hdr.substr(p+18, e-(p+18)); for(size_t i=0;i<v.size();i++){ char c=v[i]; if(c>='A'&&c<='Z') v[i]=c-'A'+'a'; }
   return v.find("chunked")!=std::string::npos; }
@@ -52,15 +77,15 @@ static int stream_fixed(int fd, size_t cl, RollingWriter* w, int& total, std::st
     else { stream_lines_bytes(buf.data(), (size_t)n, w, total, lastSeg, anyFlushed); }
   }
   return 0; }
-static int stream_chunked(int fd, RollingWriter* w, int& total, std::string& lastSeg, bool& anyFlushed){ const size_t BUFSZ=1<<20; std::vector<char> buf; buf.resize(BUFSZ); while(true){ std::string line; char c; while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0) return -1; if(c=='\r'){ ssize_t n2=::read(fd, &c, 1); if(n2<=0) return -1; if(c=='\n') break; } else { line.push_back(c); } }
-    size_t sz=strtoull(line.c_str(), nullptr, 16); if(sz==0){ char crlf[2]; if(read_exact(fd, crlf, 2)<=0) return -1; break; } size_t off=0; while(off<sz){ size_t toRead = sz-off>BUFSZ? BUFSZ: sz-off; ssize_t n=read_exact(fd, buf.data(), toRead); if(n<=0) return -1; stream_lines_bytes(buf.data(), (size_t)n, w, total, lastSeg, anyFlushed); off += (size_t)n; }
+static int stream_chunked(int fd, RollingWriter* w, int& total, std::string& lastSeg, bool& anyFlushed){ const size_t BUFSZ=1<<20; std::vector<char> buf; buf.resize(BUFSZ); size_t processed=0; size_t maxb=get_max_body_bytes(); while(true){ std::string line; char c; while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0) return -1; if(c=='\r'){ ssize_t n2=::read(fd, &c, 1); if(n2<=0) return -1; if(c=='\n') break; } else { line.push_back(c); } }
+    size_t sz=strtoull(line.c_str(), nullptr, 16); if(sz==0){ char crlf[2]; if(read_exact(fd, crlf, 2)<=0) return -1; break; } size_t off=0; while(off<sz){ size_t toRead = sz-off>BUFSZ? BUFSZ: sz-off; ssize_t n=read_exact(fd, buf.data(), toRead); if(n<=0) return -1; processed += (size_t)n; if(processed>maxb) return -2; stream_lines_bytes(buf.data(), (size_t)n, w, total, lastSeg, anyFlushed); off += (size_t)n; }
     char crlf2[2]; if(read_exact(fd, crlf2, 2)<=0) return -1; }
   return 0; }
 static int stream_zstd_fixed(int fd, size_t cl, RollingWriter* w, int& total, std::string& lastSeg, bool& anyFlushed){ const size_t ZIN=1<<20; const size_t ZOUT=1<<20; std::vector<char> in; in.resize(ZIN); std::vector<char> out; out.resize(ZOUT); ZSTD_DStream* zds = ZSTD_createDStream(); ZSTD_initDStream(zds); ZSTD_inBuffer ibuf; ZSTD_outBuffer obuf; size_t remain=cl; while(remain>0){ size_t toRead = remain>ZIN? ZIN: remain; ssize_t n=read_exact(fd, in.data(), toRead); if(n<=0) break; remain -= (size_t)n; ibuf.src = in.data(); ibuf.size = (size_t)n; ibuf.pos = 0; while(ibuf.pos < ibuf.size){ obuf.dst = out.data(); obuf.size = ZOUT; obuf.pos = 0; size_t rc = ZSTD_decompressStream(zds, &obuf, &ibuf); if(ZSTD_isError(rc)) break; if(obuf.pos>0){ stream_lines_bytes(out.data(), obuf.pos, w, total, lastSeg, anyFlushed); } }
   }
   ZSTD_freeDStream(zds); return 0; }
-static int stream_zstd_chunked(int fd, RollingWriter* w, int& total, std::string& lastSeg, bool& anyFlushed){ const size_t ZIN=1<<20; const size_t ZOUT=1<<20; std::vector<char> in; in.resize(ZIN); std::vector<char> out; out.resize(ZOUT); ZSTD_DStream* zds = ZSTD_createDStream(); ZSTD_initDStream(zds); while(true){ std::string line; char c; while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0){ ZSTD_freeDStream(zds); return -1; } if(c=='\r'){ ssize_t n2=::read(fd, &c, 1); if(n2<=0){ ZSTD_freeDStream(zds); return -1; } if(c=='\n') break; } else { line.push_back(c); } }
-    size_t sz=strtoull(line.c_str(), nullptr, 16); if(sz==0){ char crlf[2]; if(read_exact(fd, crlf, 2)<=0){ ZSTD_freeDStream(zds); return -1; } break; } size_t off=0; while(off<sz){ size_t toRead = sz-off>ZIN? ZIN: sz-off; ssize_t n=read_exact(fd, in.data(), toRead); if(n<=0){ ZSTD_freeDStream(zds); return -1; } ZSTD_inBuffer ibuf; ZSTD_outBuffer obuf; ibuf.src = in.data(); ibuf.size = (size_t)n; ibuf.pos = 0; while(ibuf.pos < ibuf.size){ obuf.dst = out.data(); obuf.size = ZOUT; obuf.pos = 0; size_t rc = ZSTD_decompressStream(zds, &obuf, &ibuf); if(ZSTD_isError(rc)) break; if(obuf.pos>0){ stream_lines_bytes(out.data(), obuf.pos, w, total, lastSeg, anyFlushed); } }
+static int stream_zstd_chunked(int fd, RollingWriter* w, int& total, std::string& lastSeg, bool& anyFlushed){ const size_t ZIN=1<<20; const size_t ZOUT=1<<20; std::vector<char> in; in.resize(ZIN); std::vector<char> out; out.resize(ZOUT); size_t processed=0; size_t maxb=get_max_body_bytes(); ZSTD_DStream* zds = ZSTD_createDStream(); ZSTD_initDStream(zds); while(true){ std::string line; char c; while(true){ ssize_t n=::read(fd, &c, 1); if(n<=0){ ZSTD_freeDStream(zds); return -1; } if(c=='\r'){ ssize_t n2=::read(fd, &c, 1); if(n2<=0){ ZSTD_freeDStream(zds); return -1; } if(c=='\n') break; } else { line.push_back(c); } }
+    size_t sz=strtoull(line.c_str(), nullptr, 16); if(sz==0){ char crlf[2]; if(read_exact(fd, crlf, 2)<=0){ ZSTD_freeDStream(zds); return -1; } break; } size_t off=0; while(off<sz){ size_t toRead = sz-off>ZIN? ZIN: sz-off; ssize_t n=read_exact(fd, in.data(), toRead); if(n<=0){ ZSTD_freeDStream(zds); return -1; } ZSTD_inBuffer ibuf; ZSTD_outBuffer obuf; ibuf.src = in.data(); ibuf.size = (size_t)n; ibuf.pos = 0; while(ibuf.pos < ibuf.size){ obuf.dst = out.data(); obuf.size = ZOUT; obuf.pos = 0; size_t rc = ZSTD_decompressStream(zds, &obuf, &ibuf); if(ZSTD_isError(rc)) break; if(obuf.pos>0){ processed += obuf.pos; if(processed>maxb){ ZSTD_freeDStream(zds); return -2; } stream_lines_bytes(out.data(), obuf.pos, w, total, lastSeg, anyFlushed); } }
       off += (size_t)n; }
     char crlf2[2]; if(read_exact(fd, crlf2, 2)<=0){ ZSTD_freeDStream(zds); return -1; } }
   ZSTD_freeDStream(zds); return 0; }
@@ -70,6 +95,7 @@ static std::map<std::string,std::string> parse_kv(const std::string& body){ std:
 static std::vector<std::string> tokenize_query(const std::string& s){ std::vector<std::string> toks; size_t i=0; auto emit=[&](size_t a,size_t b){ if(b>a) toks.emplace_back(s.substr(a,b-a)); }; while(i<s.size()){ while(i<s.size() && (s[i]==' '||s[i]=='\t')) i++; if(i>=s.size()) break; size_t j=i; while(j<s.size() && s[j]!=' ' && s[j]!='\t' && s[j]!=':' && s[j]!='=' && s[j]!=',' && s[j]!='(' && s[j]!=')') j++; emit(i,j); if(j<s.size()){ char c=s[j]; if(c==':'||c=='='||c==','||c=='('||c==')'){ std::string d; d.push_back(c); toks.emplace_back(d); } j++; } i=j; } return toks; }
 static void respond_json(int cfd, int code, const std::string& body){ char hdr[256]; snprintf(hdr, sizeof(hdr), "HTTP/1.1 %d OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", code, body.size()); write_all(cfd, hdr, strlen(hdr)); write_all(cfd, body.c_str(), body.size()); }
 static void respond_busy(int cfd){ const char* body = "{\"error\":\"server busy\"}"; char hdr[256]; snprintf(hdr, sizeof(hdr), "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body)); write_all(cfd, hdr, strlen(hdr)); write_all(cfd, body, strlen(body)); }
+static void respond_too_large(int cfd){ const char* body = "{\"error\":\"payload too large\"}"; char hdr[256]; snprintf(hdr, sizeof(hdr), "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body)); write_all(cfd, hdr, strlen(hdr)); write_all(cfd, body, strlen(body)); }
 
 static std::string pretty_json(const std::string& s){
   std::string out; out.reserve(s.size()*2);
@@ -154,7 +180,7 @@ static void compute_index_usage(const std::string& dir, int& segments, size_t& b
 
 static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.empty()){ ::close(cfd); return; } std::string method,path; parse_request_line(hdrs, method, path); size_t qpos=path.find('?'); std::string rpath = qpos==std::string::npos? path : path.substr(0,qpos); std::string qs = qpos==std::string::npos? std::string() : path.substr(qpos+1); if(rpath.size()>1 && rpath.back()=='/') rpath.pop_back(); size_t hdrEnd=hdrs.find("\r\n\r\n"); size_t contentLen = find_content_length(hdrs); std::string body;
     if((method=="GET" || method=="HEAD") && rpath=="/health"){ respond_json(cfd, 200, std::string("{\"status\":\"ok\"}")); }
-    else if((method=="POST" || method=="GET") && rpath=="/query"){ if(contentLen>0){ body.reserve(contentLen); const size_t BUFSZ=1<<16; std::vector<char> tmp; tmp.resize(BUFSZ); size_t remain=contentLen; while(remain>0){ size_t toRead = remain>BUFSZ? BUFSZ: remain; ssize_t n=read_exact(cfd, tmp.data(), toRead); if(n<=0) break; body.append(tmp.data(), tmp.data()+n); remain -= (size_t)n; } }
+    else if((method=="POST" || method=="GET") && (rpath=="/query" || rpath=="/search")){ if(contentLen>0){ size_t maxb=get_max_body_bytes(); if(contentLen>maxb){ respond_too_large(cfd); ::close(cfd); return; } body.reserve(contentLen); const size_t BUFSZ=1<<16; std::vector<char> tmp; tmp.resize(BUFSZ); size_t remain=contentLen; while(remain>0){ size_t toRead = remain>BUFSZ? BUFSZ: remain; ssize_t n=read_exact(cfd, tmp.data(), toRead); if(n<=0) break; body.append(tmp.data(), tmp.data()+n); remain -= (size_t)n; } }
       auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string q= kv.count("q")? kv["q"]: std::string(); int limit= kv.count("limit")? atoi(kv["limit"].c_str()) : 100; bool want_pretty = kv.count("pretty") ? (!kv["pretty"].empty()) : false; if(index.empty()||q.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index or q\"}")); }
       else{
         auto it = g_index_map.find(index); if(it==g_index_map.end()){ respond_json(cfd, 400, std::string("{\"error\":\"unknown index\"}")); }
@@ -193,7 +219,7 @@ static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.
               else if(cmd.type==SPL_GROUP_BY){ std::vector<std::string> mem = tokenize_query(left); char* args[MAX_CMD_ARG_COUNT]; int ac=(int)mem.size(); if(ac<=0){ mem.push_back(std::string()); ac=1; } for(int i=0;i<ac;i++){ args[i]=(char*)mem[i].c_str(); } std::string jout; disp.Aggregate_Group_JSON(args, ac, cmd.group, cmd.op, cmd.valueAlias, jout); respond_json(cfd, 200, jout); handled=true; }
               }
           }
-          if(!handled){ std::vector<std::string> mem = tokenize_query(baseq); auto has_logic = [&](const std::vector<std::string>& v){ for(size_t i=0;i<v.size();i++){ const std::string& t=v[i]; if(t=="and"||t=="OR"||t=="or"||t=="not") return true; } return false; }; std::vector<std::string> mem2; if(mem.size()>=2 && !has_logic(mem)){ mem2.reserve(mem.size()*2-1); for(size_t i=0;i<mem.size();i++){ if(i>0) mem2.emplace_back(std::string("and")); mem2.emplace_back(mem[i]); } } else { mem2.swap(mem); } char* args[MAX_CMD_ARG_COUNT]; int ac=(int)mem2.size(); if(ac<=0){ mem2.push_back(std::string()); ac=1; } for(int i=0;i<ac;i++){ args[i]=(char*)mem2[i].c_str(); } std::string json; disp.SearchByWildcard_JSON(args, ac, limit, json); if(want_pretty){ std::string pj = pretty_json(json); respond_json(cfd, 200, pj); } else { respond_json(cfd, 200, json); } }
+          if(!handled){ std::vector<std::string> mem = tokenize_query(baseq); auto has_logic = [&](const std::vector<std::string>& v){ for(size_t i=0;i<v.size();i++){ const std::string& t=v[i]; if(t=="and"||t=="AND"||t=="OR"||t=="or"||t=="NOT"||t=="not") return true; } return false; }; std::vector<std::string> mem2; if(mem.size()>=2 && !has_logic(mem)){ mem2.reserve(mem.size()*2-1); for(size_t i=0;i<mem.size();i++){ if(i>0) mem2.emplace_back(std::string("and")); mem2.emplace_back(mem[i]); } } else { mem2.swap(mem); } char* args[MAX_CMD_ARG_COUNT]; int ac=(int)mem2.size(); if(ac<=0){ mem2.push_back(std::string()); ac=1; } for(int i=0;i<ac;i++){ args[i]=(char*)mem2[i].c_str(); } std::string json; disp.SearchByWildcard_JSON(args, ac, limit, json); if(want_pretty){ std::string pj = pretty_json(json); respond_json(cfd, 200, pj); } else { respond_json(cfd, 200, json); } }
           disp.DisConnect(); }
         }
       }
@@ -201,8 +227,9 @@ static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.
     else if(method=="POST" && rpath=="/_bulk"){ auto kv=parse_kv(std::string()); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } const char* lms = getenv("LOGGREP_TEST_LATENCY_MS"); if(lms){ int ms = atoi(lms); if(ms>0){ usleep(ms*1000); } } std::string index = kv.count("index")? kv["index"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
       else { RollingWriter* w=get_writer(index); if(!w){ respond_json(cfd, 400, std::string("{\"error\":\"unknown index\"}")); }
         else { int total=0; std::string lastSeg; bool anyFlushed=false; std::string enc = find_content_encoding(hdrs); for(size_t i=0;i<enc.size();i++){ char c=enc[i]; if(c>='A'&&c<='Z') enc[i]=c-'A'+'a'; }
-          bool chunked = has_chunked(hdrs); if(enc=="zstd"){ if(chunked){ stream_zstd_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); stream_zstd_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
-          else { if(chunked){ stream_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); stream_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
+          bool chunked = has_chunked(hdrs); int rc=0; if(enc=="zstd"){ if(chunked){ rc=stream_zstd_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); size_t maxb=get_max_body_bytes(); if(cl>maxb){ respond_too_large(cfd); ::close(cfd); return; } rc=stream_zstd_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
+          else { if(chunked){ rc=stream_chunked(cfd, w, total, lastSeg, anyFlushed); } else { size_t cl = find_content_length(hdrs); size_t maxb=get_max_body_bytes(); if(cl>maxb){ respond_too_large(cfd); ::close(cfd); return; } rc=stream_fixed(cfd, cl, w, total, lastSeg, anyFlushed); } }
+          if(rc==-2){ respond_too_large(cfd); ::close(cfd); return; }
           bool synced=false; if(kv.count("sync") && !kv["sync"].empty()){ w->sync_wal(); synced=true; }
           if(kv.count("flush") && !kv["flush"].empty()){ std::string seg2; int fr = w->flush(seg2); if(!seg2.empty()){ anyFlushed=true; lastSeg=seg2; } }
           std::string out; out.reserve(160); out.append("{"); out.append("\"ingested\":"); out.append(std::to_string(total)); out.append(",\"flushed\":"); out.append(anyFlushed?"true":"false"); if(anyFlushed){ out.append(",\"segment\":\""); out.append(lastSeg); out.append("\""); } out.append(",\"synced\":"); out.append(synced?"true":"false"); out.append("}"); respond_json(cfd, 200, out);
@@ -213,23 +240,34 @@ static void handle_client(int cfd){ std::string hdrs=read_headers(cfd); if(hdrs.
     else if(method=="POST" && rpath=="/indices"){ if(contentLen>0){ body.reserve(contentLen); const size_t BUFSZ=1<<16; std::vector<char> tmp; tmp.resize(BUFSZ); size_t remain=contentLen; while(remain>0){ size_t toRead = remain>BUFSZ? BUFSZ: remain; ssize_t n=read_exact(cfd, tmp.data(), toRead); if(n<=0) break; body.append(tmp.data(), tmp.data()+n); remain -= (size_t)n; } }
       auto kv=parse_kv(body); auto qkv=parse_kv(qs); for(auto &it: qkv){ if(!kv.count(it.first)) kv[it.first]=it.second; } std::string index = kv.count("index")? kv["index"]: std::string(); std::string pathv = kv.count("path")? kv["path"]: std::string(); std::string del = kv.count("delete")? kv["delete"]: std::string(); if(index.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing index\"}")); }
       else { if(!del.empty()){ auto it=g_index_map.find(index); if(it!=g_index_map.end()){ g_index_map.erase(it); save_indices(); } respond_json(cfd, 200, std::string("{\"ok\":true}")); }
-        else if(pathv.empty()){ respond_json(cfd, 400, std::string("{\"error\":\"missing path\"}")); }
-        else { g_index_map[index]=pathv; save_indices(); respond_json(cfd, 200, std::string("{\"ok\":true}")); } }
+        else {
+          if(pathv.empty()){
+            if(!g_data_root.empty()){ pathv = join_path2(g_data_root, index); }
+            else { respond_json(cfd, 400, std::string("{\"error\":\"missing path\"}")); ::close(cfd); return; }
+          }
+          g_index_map[index]=pathv; save_indices(); write_index_settings_conf(pathv, kv); respond_json(cfd, 200, std::string("{\"ok\":true}")); }
+      }
     }
+    else if((method=="GET" || method=="HEAD") && rpath=="/metrics"){ std::string out; out.append("{"); out.append("\"pending\":"); out.append(std::to_string(g_pending_count.load())); out.append(",\"workers\":"); out.append(std::to_string(g_worker_count)); out.append(",\"max_pending\":"); out.append(std::to_string(g_max_pending_global)); out.append(",\"indices\":"); out.append(std::to_string((int)g_index_map.size())); { std::lock_guard<std::mutex> lk(g_writers_mtx); out.append(",\"writers\":"); out.append(std::to_string((int)g_writers.size())); } out.append("}"); respond_json(cfd, 200, out); }
     else{ respond_json(cfd, 404, std::string("{\"error\":\"not found\"}")); }
     ::close(cfd);
 }
 
-int main(int argc, char** argv){ int port=8080; if(argc>1){ port=atoi(argv[1]); if(port<=0) port=8080; } int sfd=::socket(AF_INET, SOCK_STREAM, 0); int opt=1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); sockaddr_in addr; memset(&addr,0,sizeof(addr)); addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons(port); if(::bind(sfd, (sockaddr*)&addr, sizeof(addr))<0){ perror("bind"); return 1; } if(::listen(sfd, 1024)<0){ perror("listen"); return 1; } printf("listening at http://localhost:%d\n", port);
+int main(int argc, char** argv){ int port=8080; if(argc>1){ port=atoi(argv[1]); if(port<=0) port=8080; } signal(SIGPIPE, SIG_IGN); int sfd=::socket(AF_INET, SOCK_STREAM, 0); int opt=1; setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); sockaddr_in addr; memset(&addr,0,sizeof(addr)); addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons(port); if(::bind(sfd, (sockaddr*)&addr, sizeof(addr))<0){ perror("bind"); return 1; } if(::listen(sfd, 1024)<0){ perror("listen"); return 1; } printf("listening at http://localhost:%d\n", port);
+  const char* scfg = getenv("LOGGREP_SERVER_CFG"); if(scfg && *scfg){ g_server_cfg = std::string(scfg); }
+  load_server_config();
+  const char* icfg = getenv("LOGGREP_INDEX_CFG"); if(icfg && *icfg){ g_index_cfg = std::string(icfg); }
+  const char* droot = getenv("LOGGREP_DATA_ROOT"); if(droot && *droot){ g_data_root = std::string(droot); }
   load_indices();
   const char* recover_flag = getenv("LOGGREP_RECOVER_AT_START");
   if(recover_flag && atoi(recover_flag) > 0){ for(auto &it: g_index_map){ recover_wal_dir(it.second); } }
   std::queue<int> q; std::mutex q_mtx; std::condition_variable q_cv; std::atomic<bool> stop(false);
-  int max_pending = 4096; const char* pv = getenv("LOGGREP_MAX_PENDING"); if(pv){ int x=atoi(pv); if(x>0) max_pending=x; }
+  int max_pending = 4096; const char* pv = getenv("LOGGREP_MAX_PENDING"); if(pv){ int x=atoi(pv); if(x>0) max_pending=x; } g_max_pending_global = max_pending;
   unsigned int nWorkers = std::thread::hardware_concurrency(); if(nWorkers==0) nWorkers = 8; const char* wv=getenv("LOGGREP_WORKERS"); if(wv){ int x=atoi(wv); if(x>0) nWorkers=(unsigned int)x; }
   std::vector<std::thread> workers; workers.reserve(nWorkers);
+  g_worker_count = (int)nWorkers;
   for(unsigned int i=0;i<nWorkers;i++){ workers.emplace_back([&](){ while(!stop.load()){ int cfd=-1; { std::unique_lock<std::mutex> lk(q_mtx); q_cv.wait(lk, [&](){ return stop.load() || !q.empty(); }); if(stop.load() && q.empty()) return; cfd = q.front(); q.pop(); g_pending_count.fetch_sub(1); } handle_client(cfd); } }); }
-  while(true){ sockaddr_in caddr; socklen_t clen=sizeof(caddr); int cfd=::accept(sfd, (sockaddr*)&caddr, &clen); if(cfd<0) continue; bool dropped=false; { std::lock_guard<std::mutex> lk(q_mtx); if((int)q.size() >= max_pending){ dropped=true; } else { q.push(cfd); g_pending_count.fetch_add(1); } }
+  while(true){ sockaddr_in caddr; socklen_t clen=sizeof(caddr); int cfd=::accept(sfd, (sockaddr*)&caddr, &clen); if(cfd<0) continue; set_client_socket_options(cfd); bool dropped=false; { std::lock_guard<std::mutex> lk(q_mtx); if((int)q.size() >= max_pending){ dropped=true; } else { q.push(cfd); g_pending_count.fetch_add(1); } }
     if(dropped){ respond_busy(cfd); ::close(cfd); } else { q_cv.notify_one(); }
   }
   stop.store(true); q_cv.notify_all(); for(auto &t: workers){ if(t.joinable()) t.join(); }

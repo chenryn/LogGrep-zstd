@@ -535,6 +535,7 @@ class BitMap
     void SetSize()
     {
       Size = DEF_BITMAP_FULL;//means all 1
+      Bitmap.set();
     }
 
     //set pos as 0
@@ -550,6 +551,7 @@ class BitMap
     //union
     void Union(int pos)
     {
+      if(Size == DEF_BITMAP_FULL) return;
       if(Bitmap[pos] == 0 && pos < MAX_FILE_LEN)
       {
         Bitmap.set(pos);
@@ -565,6 +567,11 @@ class BitMap
       if(target->Size == 0)
       {
         Reset();
+        return;
+      }
+      if(Size == DEF_BITMAP_FULL)
+      {
+        CloneFrom(target);
         return;
       }
       int tempSize = Size;
@@ -637,7 +644,7 @@ class BitMap
       if(target == NULL) return;
       if(target->Size == DEF_BITMAP_FULL)
       {
-        Size = DEF_BITMAP_FULL;//universal set
+        SetSize();
       }
       else
       {
@@ -655,6 +662,7 @@ class BitMap
 
     int GetSize()
     {
+      if(Size == DEF_BITMAP_FULL) return TotalSize;
       return Size;
     }
 
@@ -672,11 +680,19 @@ class BitMap
     {
       TotalSize = target->TotalSize;
       Size = target->Size;
-      for(int i=0;i< Size; i++)
+      if(Size != DEF_BITMAP_FULL)
       {
-        Index[i] = target->Index[i];
+        for(int i=0;i< Size; i++)
+        {
+          Index[i] = target->Index[i];
+        }
+        Bitmap = target->Bitmap;
       }
-      Bitmap |= target->Bitmap;
+      else
+      {
+        Bitmap.set();
+      }
+      return 1;
     }
 };
 
@@ -738,24 +754,34 @@ class BitMap
       {
         return;
       }
+      if(Size == DEF_BITMAP_FULL)
+      {
+        Size = target->Size;
+        Bitmap = target->Bitmap;
+        return;
+      }
       if(target->Size == 0)
       {
         Reset();
         return;
       }
       Bitmap &= target->Bitmap;
+      Size = Bitmap.count();
     }
     void Union(BitMap* target)
     {
-      if(target == NULL) return;
+      if(target == NULL || target->Size == 0) return;
       if(target->Size == DEF_BITMAP_FULL)
       {
-        Size = DEF_BITMAP_FULL;//universal set
+        Size = DEF_BITMAP_FULL;
+        return;
       }
-      else
+      if(Size == DEF_BITMAP_FULL)
       {
-        Bitmap |= target->Bitmap;
+        return;
       }
+      Bitmap |= target->Bitmap;
+      Size = Bitmap.count();
     }
     void Complement(BitMap* target)
     {

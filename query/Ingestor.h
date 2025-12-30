@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -31,12 +32,14 @@ private:
     long long m_start_ms;
     std::thread m_flusher;
     std::atomic<bool> m_stop;
+    std::condition_variable m_cv;
     void bg_worker();
     long long now_ms();
     void ensure_dir();
     void open_new_wal();
     void fsync_wal();
     void load_existing_segments();
+    void load_index_config();
 public:
     RollingWriter(const std::string& dir);
     ~RollingWriter();

@@ -14,6 +14,7 @@ extern "C" int compress_from_memory(const char* buffer, int buffer_len, const ch
 #include <cstdlib>
 #include <dirent.h>
 #include <limits>
+#include <fstream>
 #ifdef LOGGREP_LOCAL_STUB
 extern "C" int compress_from_memory(const char* buffer, int buffer_len, const char* output_path){
     FILE* f = fopen(output_path, "w");
@@ -89,6 +90,7 @@ void RollingWriter::fsync_wal(){ if(m_fsync_wal && m_wal_fd>0){ ::fsync(m_wal_fd
 RollingWriter::RollingWriter(const std::string& dir)
     : m_dir(dir), m_buf(), m_bytes(0), m_records(0), m_flush_bytes(64*1024*1024), m_flush_records(50000),
       m_last_flush_ms(0), m_flush_interval_ms(3000), m_segments(), m_max_segments(100), m_max_disk_bytes(0), m_segments_bytes(0), m_seq(0), m_wal_fd(-1), m_wal_path(), m_fsync_wal(false), m_start_ms(0), m_flusher(), m_stop(false){
+    load_index_config();
     const char* v;
     v=getenv("LOGGREP_FLUSH_BYTES"); if(v){ size_t x=parse_size_bytes(v); if(x>0) m_flush_bytes=x; }
     v=getenv("LOGGREP_FLUSH_RECORDS"); if(v){ long long x=strtoll(v,nullptr,10); if(x>0) m_flush_records=(int)x; }
@@ -110,6 +112,7 @@ int RollingWriter::append(const std::string& line){
     m_bytes = m_buf.size();
     if(m_records==0) m_start_ms = now_ms();
     m_records += 1;
+    m_cv.notify_one();
     return 1;
 }
 
@@ -232,20 +235,38 @@ int RollingWriter::flush(std::string& out_segment){
 RollingWriter::~RollingWriter(){ m_stop.store(true); if(m_flusher.joinable()) m_flusher.join(); }
 
 void RollingWriter::bg_worker(){
-    const int SLEEP_MS = 100;
     while(!m_stop.load()){
-        bool need=false;
+        long long wait_ms = 0;
         {
             std::lock_guard<std::mutex> lk(mtx);
             if(m_flush_interval_ms>0 && m_records>0){
                 long long now = now_ms();
                 long long base = (m_last_flush_ms==0)? m_start_ms : m_last_flush_ms;
                 if(base==0) base = now;
-                if(now - base >= m_flush_interval_ms) need=true;
+                long long elapsed = now - base;
+                if(elapsed < m_flush_interval_ms) wait_ms = m_flush_interval_ms - elapsed;
+            }
+        }
+        if(wait_ms > 0){
+            std::unique_lock<std::mutex> ul(mtx);
+            m_cv.wait_for(ul, std::chrono::milliseconds(wait_ms));
+        } else {
+            std::unique_lock<std::mutex> ul(mtx);
+            m_cv.wait_for(ul, std::chrono::milliseconds(m_flush_interval_ms>0? m_flush_interval_ms: 100));
+        }
+        bool need=false;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if(m_records>0){
+                long long now = now_ms();
+                long long base = (m_last_flush_ms==0)? m_start_ms : m_last_flush_ms;
+                if(base==0) base = now;
+                if(m_flush_interval_ms>0 && now - base >= m_flush_interval_ms) need=true;
+                if(m_bytes >= m_flush_bytes) need=true;
+                if(m_records >= m_flush_records) need=true;
             }
         }
         if(need){ std::string seg; flush(seg); }
-        usleep(1000*SLEEP_MS);
     }
 }
 void RollingWriter::load_existing_segments(){
@@ -282,4 +303,24 @@ void RollingWriter::load_existing_segments(){
         struct stat stod; if(stat(old.c_str(), &stod)==0){ size_t osz=(size_t)stod.st_size; if(m_segments_bytes>=osz) m_segments_bytes -= osz; }
         unlink(old.c_str());
     }
+}
+
+void RollingWriter::load_index_config(){
+    std::string cfg = join_path(m_dir, std::string("ingest.conf"));
+    std::ifstream in(cfg.c_str());
+    if(!in.good()) return;
+    std::string line;
+    while(std::getline(in, line)){
+        size_t pos = line.find('=');
+        if(pos==std::string::npos) continue;
+        std::string k = line.substr(0,pos);
+        std::string v = line.substr(pos+1);
+        if(k=="FLUSH_BYTES"){ size_t x=parse_size_bytes(v.c_str()); if(x>0) m_flush_bytes=x; }
+        else if(k=="FLUSH_RECORDS"){ long long x=strtoll(v.c_str(),nullptr,10); if(x>0) m_flush_records=(int)x; }
+        else if(k=="FLUSH_INTERVAL_MS"){ long long x=strtoll(v.c_str(),nullptr,10); if(x>=0) m_flush_interval_ms=x; }
+        else if(k=="MAX_SEGMENTS"){ long long x=strtoll(v.c_str(),nullptr,10); if(x>0) m_max_segments=(int)x; }
+        else if(k=="MAX_DISK_BYTES"){ size_t x=parse_size_bytes(v.c_str()); if(x>0) m_max_disk_bytes=x; }
+        else if(k=="WAL_FSYNC"){ int x=atoi(v.c_str()); m_fsync_wal = (x>0); }
+    }
+    in.close();
 }

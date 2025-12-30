@@ -3,7 +3,7 @@ cd zstd-dev/lib && make
 cd ../../compression && make
 cd ../query && make server
 # 启动服务器
-LOGGREP_FLUSH_RECORDS=1 LOGGREP_WAL_FSYNC=1 ./thulr_server 8080 &
+LOGGREP_RECOVER_AT_START=1 LOGGREP_MAX_DISK_BYTES=5g LOGGREP_MAX_SEGMENTS=1000 LOGGREP_FLUSH_BYTES=64m LOGGREP_FLUSH_RECORDS=50000 LOGGREP_FLUSH_INTERVAL_MS=5000 LOGGREP_WAL_FSYNC=1 ./thulr_server 8080 &
 sleep 2
 cd ..
 curl -s "http://localhost:8080/health"
@@ -19,6 +19,9 @@ curl -s -X POST "http://localhost:8080/indices" -d "index=Spark&path=./ingest_ex
 curl -s -X POST "http://localhost:8080/indices" -d "index=Ssh&path=./ingest_example/Ssh"
 curl -s -X POST "http://localhost:8080/indices" -d "index=Zookeeper&path=./ingest_example/Zookeeper"
 
+# 通过 Request Body 设置索引级刷新策略（服务器将自动生成 ingest.conf）
+curl -s -X POST "http://localhost:8080/indices" -d "index=Access&path=./ingest_example/access&flush_records=1&flush_interval_ms=0&wal_fsync=1"
+
 # 写入数据
 curl -s -X POST "http://localhost:8080/_bulk?index=Apache&sync=1" --data-binary @example/Apache/0.log
 curl -s -X POST "http://localhost:8080/_bulk?index=Healthapp&sync=1" --data-binary @example/Healthapp/0.log
@@ -32,6 +35,7 @@ curl -s -X POST "http://localhost:8080/_bulk?index=Spark&sync=1" --data-binary @
 curl -s -X POST "http://localhost:8080/_bulk?index=Ssh&sync=1" --data-binary @example/Ssh/0.log
 curl -s -X POST "http://localhost:8080/_bulk?index=Ssh&sync=1" --data-binary @example/Ssh/1.log
 curl -s -X POST "http://localhost:8080/_bulk?index=Zookeeper&sync=1" --data-binary @example/Zookeeper/0.log
+# zstd -T0 -19 --long=31 --stdout example/Access/0.log | curl -s --http1.1 -X POST "http://localhost:8080/_bulk?index=Access&sync=1" -H "Content-Encoding: zstd" --data-binary @-
 curl -s "http://localhost:8080/indices"
 
 # 生成各索引目录的变量别名配置
@@ -45,34 +49,29 @@ python3 query/var_discover.py ./query/ingest_example/Spark --all
 python3 query/var_discover.py ./query/ingest_example/Ssh --all
 python3 query/var_discover.py ./query/ingest_example/Zookeeper --all
 
-# 查询
-curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request&limit=10&pretty=1"
+# 可成功的查询
+curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error&limit=1&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request&limit=1&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request|stats count by host&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request|stats count by hostname&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Apache&q=error AND Invalid URI in request|top(ip,10)&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Healthapp&q=Step_ExtSDM AND totalAltitude=0&limit=10&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Healthapp&q=Step_ExtSDM AND totalAltitude=0&limit=1&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Healthapp&q=Step_ExtSDM AND totalAltitude=0|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Hpc&q=unavailable state AND HWID=3378&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Hpc&q=unavailable state AND HWID=3378|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214|distinct(ip)&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Mac&q=failed AND Err:-1 Errno:1&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Mac&q=failed AND Err:-1 Errno:1|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Proxifier&q=HTTPS AND play.google.com:443&limit=10&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Proxifier&q=HTTPS AND play.google.com:443&limit=1&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Proxifier&q=HTTPS AND play.google.com:443|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result|stats count by host&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result|stats count by hostname&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from AND 202.100.179.208&limit=10&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from AND 202.100.179.208|stats count()&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from|stats count by host&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from|stats count by hostname&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from|top 10 ip&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from|stats distinct(ip)&pretty=1"
-curl -s -X POST "http://localhost:8080/query" -d "index=Zookeeper&q=ERROR AND CommitProcessor&limit=10&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from|stats count by ip&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from AND 202.100.179.208|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Ssh&q=Received disconnect from AND 202.100.179.208&limit=1&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Zookeeper&q=ERROR AND CommitProcessor&limit=1&pretty=1"
 curl -s -X POST "http://localhost:8080/query" -d "index=Zookeeper&q=ERROR AND CommitProcessor|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Hpc&q=unavailable state AND HWID=3378|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Hpc&q=unavailable state AND HWID=3378&limit=1&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214|distinct(ip)&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Linux&q=authentication failure AND rhost=221.230.128.214&limit=1&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Mac&q=failed AND Err:-1 Errno:1|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Mac&q=failed AND Err:-1 Errno:1&limit=1&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result&limit=1&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result|stats count()&pretty=1"
+curl -s -X POST "http://localhost:8080/query" -d "index=Spark&q=ERROR AND Error sending result|timechart bins=5 count&pretty=1"
