@@ -145,7 +145,7 @@ private:
 	int GetDicIndexs(int varName, const char* regPattern, int queryType, OUT char* &dicQuerySegs);
 	int GetDicOffsetByEntry(SubPattern* subpat, int dicNo, int& dicLen);
 	int GetVarOutliers_BM(int varName, const char *queryStr, int queryType, BitMap* bitmap, BitMap* refBitmap);
-	int FilterNumericVar(int varfname, const char* expr, BitMap* bitmap);
+	int FilterNumericVar(int varId, const char* expr, BitMap* bitmap);
 	int CheckBloom(int varfname, const char* value);
 	int GetOutliers_MultiToken(char *args[MAX_CMD_ARG_COUNT], int argCountS, int argCountE, BitMap* bitmap, bool beReverse=false);
 	int GetOutliers_SinglToken(char *arg, BitMap* bitmap, bool beReverse=false);
@@ -210,6 +210,8 @@ public:
     int SearchByWildcard_Token_JSON(char *args[MAX_CMD_ARG_COUNT], int argCount, int matNum, std::string &json_out);
     int CountByWildcard_Token(char *args[MAX_CMD_ARG_COUNT], int argCount);
     int BuildBitmapsForQuery(char *args[MAX_CMD_ARG_COUNT], int argCount, LISTBITMAPS &bitmaps);
+    int GetVarType(int varId);
+    void RemovePadding(const char* padded, int len, char* result);
     int GetMatchedTimeRange(char *args[MAX_CMD_ARG_COUNT], int argCount, long long& tmin, long long& tmax);
     int Timechart_Count_BySpan(char *args[MAX_CMD_ARG_COUNT], int argCount, long long span_ms, std::map<long long,int>& buckets);
     int Timechart_Count_ByBins(char *args[MAX_CMD_ARG_COUNT], int argCount, long long start_ms, long long end_ms, int bins, std::vector<int>& counts);

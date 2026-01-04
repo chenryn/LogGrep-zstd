@@ -16,6 +16,27 @@
 #include <sstream>
 #include <iomanip>
 
+void LogStoreApi::RemovePadding(const char* padded, int len, char* result) {
+    if (!padded || !result || len <= 0) return;
+    int i = 0;
+    while (i < len && padded[i] == ' ') i++;
+    int j = len - 1;
+    while (j >= i && padded[j] == ' ') j--;
+    int k = 0;
+    for (int m = i; m <= j; m++) {
+        result[k++] = padded[m];
+    }
+    result[k] = '\0';
+}
+
+int LogStoreApi::GetVarType(int varId) {
+    auto it = m_subpatterns.find(varId);
+    if (it != m_subpatterns.end()) {
+        return it->second->Type;
+    }
+    return -1;
+}
+
 // JSON string escaping utility
 static std::string escape_json(const std::string& input) {
     std::ostringstream ss;
@@ -717,7 +738,8 @@ int LogStoreApi::DeCompressCapsule(int patName, OUT Coffer* &coffer, int type)
 	
 	if(ret < 0)
 	{
-		SyslogError("Error: not find varname:%s in meta:%s!\n", FormatVarName(patName), FileName.c_str());
+		SyslogError("Error: not find varname:%s (pid:%d, vid:%d, type:%d) in meta:%s!\n", 
+			FormatVarName(patName), (patName >> 16) & 0xFFFF, (patName >> 8) & 0xFF, patName & 0xF, FileName.c_str());
 	}
 	return ret;
 }
@@ -889,7 +911,8 @@ int LogStoreApi::QueryByBM_Union(int varname, const char* queryStr, int queryTyp
 int LogStoreApi::QueryByBM_Union_RefRange(int varname, const char* queryStr, int queryType, BitMap* bitmap, RegMatrix* refRange)
 {
 	Coffer* meta;
-	int varfname = varname +  VAR_TYPE_DIC;
+	int varType = GetVarType(varname);
+	int varfname = varname + (varType == VAR_TYPE_DIC ? VAR_TYPE_DIC : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 	int len = DeCompressCapsule(varfname, meta);
 	if(len <=0)
 	{
@@ -1698,13 +1721,14 @@ int LogStoreApi::GetVals_AxB_Dic(int varName, const char* queryA, const char* qu
 	char* dicQuerySegs = NULL;
 	int num = 0;
 	m_glbExchgBitmap->Reset();
-	int varfname = varName +  VAR_TYPE_DIC;
+	int varType = GetVarType(varName);
+	int varfname = varName + (varType == VAR_TYPE_DIC ? VAR_TYPE_DIC : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 	//search in .dic
 	num = QueryByBM_AxB_Union(varfname, queryA, queryB, m_glbExchgBitmap);
 	//if matched in .dic, then get bitmap in .entry
 	if(num > 0)
 	{
-		varfname = varName +  VAR_TYPE_ENTRY;
+		varfname = varName + (varType == VAR_TYPE_DIC ? VAR_TYPE_ENTRY : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 		int entryLen = m_glbMeta[varfname]->eleLen;
 		//dic search result may be bigger than 1
 		char* paddingStr = new char[MAX_DICENTY_LEN * num];
@@ -1755,7 +1779,8 @@ int LogStoreApi::GetVals_Dic_Pushdown_RefMap(int varName, const char* regPattern
 	{
 		Statistic.total_queried_cap_cnt++;
 		Statistic.valid_cap_filter_cnt +=2;
-		int varfname = varName +  VAR_TYPE_ENTRY;
+		int varType = GetVarType(varName);
+		int varfname = varName + (varType == VAR_TYPE_DIC ? VAR_TYPE_ENTRY : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 		QueryByBM_Pushdown_ForDic_RefMap(varfname, dicQuerySegs, num, bitmap, refBitmap);
 		delete dicQuerySegs;
 	}
@@ -1931,8 +1956,9 @@ int LogStoreApi::GetOutliers_SinglToken_RefMap(char *arg, BitMap* bitmap, BitMap
 //return true or false
 int LogStoreApi::Materializ_Dic(int varname, BitMap* bitmap, int entryCnt, OUT char* vars)
 {
+	int varType = GetVarType(varname);
 	int dicname = varname + VAR_TYPE_DIC;
-	int entryname = varname + VAR_TYPE_ENTRY;
+	int entryname = varname + (varType == VAR_TYPE_DIC ? VAR_TYPE_ENTRY : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 	//load entries and dic
 	Coffer* entryMeta; Coffer* dicMeta;
 	int ret = DeCompressCapsule(entryname, entryMeta, 1);
@@ -1989,8 +2015,9 @@ int LogStoreApi::Materializ_Dic(int varname, BitMap* bitmap, int entryCnt, OUT c
 
 int LogStoreApi::Materializ_Dic_Kmp(int varname, BitMap* bitmap, int entryCnt, OUT char* vars)
 {
+	int varType = GetVarType(varname);
 	int dicname = varname + VAR_TYPE_DIC;
-	int entryname = varname + VAR_TYPE_ENTRY;
+	int entryname = varname + (varType == VAR_TYPE_DIC ? VAR_TYPE_ENTRY : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 	//load entries and dic
 	Coffer* entryMeta; Coffer* dicMeta;
 	int ret = DeCompressCapsule(entryname, entryMeta, 1);
@@ -2205,14 +2232,21 @@ int LogStoreApi::Materializ_Pats(int varname, BitMap* bitmap, int entryCnt, OUT 
 int LogStoreApi::Materializ_Var(int varname, BitMap* bitmap, int entryCnt, OUT char* vars)
 {
 	int ret = 0;
-	varname += VAR_TYPE_VAR;
+	int varType = GetVarType(varname);
+	int varfname;
+	
+	if (varType == VAR_TYPE_DIC) {
+		return Materializ_Dic(varname, bitmap, entryCnt, vars);
+	}
+	
+	varfname = varname + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
 	if(bitmap->BeSizeFul())
 	{
-		ret = LoadcVars(varname, entryCnt, vars, MAX_VALUE_LEN);
+		ret = LoadcVars(varfname, entryCnt, vars, MAX_VALUE_LEN);
 	}
 	else
 	{
-		ret = LoadcVarsByBitmap(varname, bitmap, vars, entryCnt, MAX_VALUE_LEN);
+		ret = LoadcVarsByBitmap(varfname, bitmap, vars, entryCnt, MAX_VALUE_LEN);
 	}
 	return ret;
 }
@@ -2584,7 +2618,8 @@ int LogStoreApi::SearchInVar_Union(int varName, char *querySeg, short querySegTa
 				return bitmapLen;
 			}
 
-			int varfname = varName + VAR_TYPE_VAR;
+			int varType = GetVarType(varName);
+			int varfname = varName + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
 			bitmapLen = QueryByBM_Union(varfname, querySeg, QTYPE_ALIGN_ANY, bitmap);
 			if(bitmapLen > 0 || bitmapLen == DEF_BITMAP_FULL)
 			{
@@ -2638,7 +2673,8 @@ int LogStoreApi::SearchInVar_AxB_Union(int varName, char *queryA, char *queryB, 
 				return bitmapLen;
 			}
 			//because no predict filtering, query will slow
-			int varfname = varName + VAR_TYPE_VAR;
+			int varType = GetVarType(varName);
+			int varfname = varName + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
 			bitmapLen = QueryByBM_AxB_Union(varfname, queryA, queryB, bitmap);
 			if(bitmapLen > 0 || bitmapLen == DEF_BITMAP_FULL)
 			{
@@ -2687,7 +2723,8 @@ int LogStoreApi::SearchInVar_Pushdown(int varName, char *querySeg, short querySe
 				return 0;
 			}
 			//because no predict filtering, query will slow
-			int varfname = varName + VAR_TYPE_VAR;
+			int varType = GetVarType(varName);
+			int varfname = varName + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
 			bitmapLen = QueryByBM_Pushdown(varfname, querySeg, bitmap, queryType);
 		}
 		else//unknown type, may skip
@@ -2714,6 +2751,9 @@ int LogStoreApi::SearchInVar_Pushdown_RefMap(int varName, char *querySeg, short 
 	{
 		if(itorsub->second->Type == VAR_TYPE_DIC) //it is dictionary
 		{
+			Statistic.total_queried_cap_cnt++;
+			int varType = GetVarType(varName);
+			int varfname = varName + (varType == VAR_TYPE_DIC ? VAR_TYPE_ENTRY : (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR));
 			bitmapLen = GetVals_Dic_Pushdown_RefMap(varName, querySeg, queryType, bitmap, refBitmap);
 		}
 		else if(itorsub->second->Type == VAR_TYPE_SUB && itorsub->second->Content != NULL)//it is subpattern
@@ -2729,7 +2769,8 @@ int LogStoreApi::SearchInVar_Pushdown_RefMap(int varName, char *querySeg, short 
 				return 0;
 			}
 			//because no predict filtering, query will slow
-			int varfname = varName + VAR_TYPE_VAR;
+			int varType = GetVarType(varName);
+			int varfname = varName + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
 			bitmapLen = QueryByBM_Pushdown_RefMap(varfname, querySeg, bitmap, refBitmap, queryType);
 		}
 		else//unknown type, may skip
@@ -3471,24 +3512,25 @@ int LogStoreApi::Search_SingleSegment(char *querySeg, OUT LISTBITMAPS &bitmaps)
                 {
                     BitMap* bitmap = new BitMap(itor->second->Count);
                     int bitmapLen = 0;
-                    LISTSUBPATS::iterator isub = m_subpatterns.find(varId);
-                    if(isub != m_subpatterns.end() && isub->second->Type == VAR_TYPE_VAR)
+                    int varType = GetVarType(varId);
+                    long tmpA=0,tmpB=0; int opt=0;
+                    if(__parse_numeric_expr(value, tmpA, tmpB, opt))
                     {
-                        int varfname = varId + VAR_TYPE_VAR;
-                        long tmpA=0,tmpB=0; int opt=0;
-                        if(__parse_numeric_expr(value, tmpA, tmpB, opt))
-                        {
-                            bitmapLen = FilterNumericVar(varfname, value.c_str(), bitmap);
-                        }
-                        else
-                        {
-                            bitmapLen = QueryByBM_Union(varfname, value.c_str(), QTYPE_ALIGN_ANY, bitmap);
-                        }
+                        bitmapLen = FilterNumericVar(varId, value.c_str(), bitmap);
                     }
                     else
                     {
-                        bitmap->SetSize();
-                        bitmapLen = SearchInVar_Pushdown(varId, (char*)value.c_str(), tag, QTYPE_ALIGN_ANY, bitmap);
+                        int varType = GetVarType(varId);
+                        if(varType == VAR_TYPE_DIC)
+                        {
+                            bitmap->SetSize();
+                            bitmapLen = SearchInVar_Pushdown(varId, (char*)value.c_str(), tag, QTYPE_ALIGN_ANY, bitmap);
+                        }
+                        else
+                        {
+                            int varfname = varId + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
+                            bitmapLen = QueryByBM_Union(varfname, value.c_str(), QTYPE_ALIGN_ANY, bitmap);
+                        }
                     }
                     if(bitmapLen > 0 || bitmap->BeSizeFul())
                     {
@@ -5434,22 +5476,55 @@ int LogStoreApi::Timechart_Count_BySpan_Group(char *args[MAX_CMD_ARG_COUNT], int
             filter = ib->second;
             if(!isEmpty && filter == NULL) continue;
         }
-        Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
+        
+        int varType = GetVarType(gvar);
+        Coffer *meta = nullptr, *dic = nullptr;
+        if (varType == VAR_TYPE_DIC) {
+            DeCompressCapsule(gvar + VAR_TYPE_ENTRY, meta, 1);
+            DeCompressCapsule(gvar + VAR_TYPE_DIC, dic, 1);
+        } else {
+            DeCompressCapsule(gvar + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR), meta, 1);
+        }
+        if (!meta) continue;
+
+        char buf[1024];
         if(filter == NULL){
-            int n = (int)m_timeValues.size(); char buf[1024];
+            int n = (int)m_timeValues.size();
             for(int i=0;i<n;i++){
-                long long v = m_timeValues[i]; long long b = (v / span_ms) * span_ms;
-                int glen = __read_line_str(meta, i, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-                gmap[key][b] += 1;
+                int glen = 0;
+                if (dic) {
+                    int dicIdx = atoi(meta->data + i * meta->eleLen, meta->eleLen);
+                    if (dicIdx < dic->lines) {
+                        int off = GetDicOffsetByEntry(m_subpatterns[gvar], dicIdx, glen);
+                        RemovePadding(dic->data + off, glen, buf); glen = strlen(buf);
+                    }
+                } else {
+                    glen = __read_line_str(meta, i, buf, sizeof(buf));
+                }
+                if (glen > 0) {
+                    long long v = m_timeValues[i]; long long b = (v / span_ms) * span_ms;
+                    std::string key(buf, (size_t)glen); gmap[key][b] += 1;
+                }
             }
         } else {
-            int n = filter->GetSize(); char buf[1024];
+            int n = filter->GetSize();
             for(int i=0;i<n;i++){
                 int idx = filter->GetIndex(i);
                 if(idx<0 || (size_t)idx>=m_timeValues.size()) continue;
-                long long v = m_timeValues[idx]; long long b = (v / span_ms) * span_ms;
-                int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-                gmap[key][b] += 1;
+                int glen = 0;
+                if (dic) {
+                    int dicIdx = atoi(meta->data + idx * meta->eleLen, meta->eleLen);
+                    if (dicIdx < dic->lines) {
+                        int off = GetDicOffsetByEntry(m_subpatterns[gvar], dicIdx, glen);
+                        RemovePadding(dic->data + off, glen, buf); glen = strlen(buf);
+                    }
+                } else {
+                    glen = __read_line_str(meta, idx, buf, sizeof(buf));
+                }
+                if (glen > 0) {
+                    long long v = m_timeValues[idx]; long long b = (v / span_ms) * span_ms;
+                    std::string key(buf, (size_t)glen); gmap[key][b] += 1;
+                }
             }
         }
     }
@@ -5476,22 +5551,54 @@ int LogStoreApi::Timechart_Count_ByBins_Group(char *args[MAX_CMD_ARG_COUNT], int
             filter = ib->second;
             if(!isEmpty && filter == NULL) continue;
         }
-        Coffer* meta=nullptr; int ret=DeCompressCapsule(gvar + VAR_TYPE_VAR, meta, 1); if(ret<=0 || !meta) continue;
         
+        int varType = GetVarType(gvar);
+        Coffer *meta = nullptr, *dic = nullptr;
+        if (varType == VAR_TYPE_DIC) {
+            DeCompressCapsule(gvar + VAR_TYPE_ENTRY, meta, 1);
+            DeCompressCapsule(gvar + VAR_TYPE_DIC, dic, 1);
+        } else {
+            DeCompressCapsule(gvar + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR), meta, 1);
+        }
+        if (!meta) continue;
+        
+        char buf[1024];
         if(filter == NULL){
-            int n = (int)m_timeValues.size(); char buf[1024];
+            int n = (int)m_timeValues.size();
             for(int i=0;i<n;i++){
                 long long v=m_timeValues[i]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
-                int glen = __read_line_str(meta, i, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-                std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+                int glen = 0;
+                if (dic) {
+                    int dicIdx = atoi(meta->data + i * meta->eleLen, meta->eleLen);
+                    if (dicIdx < dic->lines) {
+                        int off = GetDicOffsetByEntry(m_subpatterns[gvar], dicIdx, glen);
+                        RemovePadding(dic->data + off, glen, buf); glen = strlen(buf);
+                    }
+                } else {
+                    glen = __read_line_str(meta, i, buf, sizeof(buf));
+                }
+                if (glen > 0) {
+                    std::string key(buf, (size_t)glen); std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+                }
             }
         } else {
-            int n = filter->GetSize(); char buf[1024];
+            int n = filter->GetSize();
             for(int i=0;i<n;i++){
                 int idx = filter->GetIndex(i);
                 if(idx<0 || (size_t)idx>=m_timeValues.size()) continue; long long v=m_timeValues[idx]; if(v<start_ms || v>end_ms) continue; long long off=v-start_ms; int bi=(int)(off/width); if(bi>=bins) bi=bins-1;
-                int glen = __read_line_str(meta, idx, buf, sizeof(buf)); if(glen<=0) continue; std::string key(buf, (size_t)glen);
-                std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+                int glen = 0;
+                if (dic) {
+                    int dicIdx = atoi(meta->data + idx * meta->eleLen, meta->eleLen);
+                    if (dicIdx < dic->lines) {
+                        int off = GetDicOffsetByEntry(m_subpatterns[gvar], dicIdx, glen);
+                        RemovePadding(dic->data + off, glen, buf); glen = strlen(buf);
+                    }
+                } else {
+                    glen = __read_line_str(meta, idx, buf, sizeof(buf));
+                }
+                if (glen > 0) {
+                    std::string key(buf, (size_t)glen); std::vector<int>& kc = gout[key]; if((int)kc.size()<bins) kc.resize(bins,0); kc[bi] += 1;
+                }
             }
         }
     }
@@ -5579,8 +5686,46 @@ static bool __parse_numeric_expr(const std::string& expr, long& outA, long& outB
     return false;
 }
 
-int LogStoreApi::FilterNumericVar(int varfname, const char* expr, BitMap* bitmap){
+int LogStoreApi::FilterNumericVar(int varId, const char* expr, BitMap* bitmap){
+    int varType = GetVarType(varId);
     long A=0,B=0; int op=0; if(!__parse_numeric_expr(std::string(expr), A, B, op)) return 0;
+
+    if(varType == VAR_TYPE_DIC){
+        int dicname = varId + VAR_TYPE_DIC, entryname = varId + VAR_TYPE_ENTRY;
+        Coffer *dicMeta=nullptr, *entryMeta=nullptr;
+        if(DeCompressCapsule(dicname, dicMeta, 1) <= 0 || !dicMeta) return 0;
+        if(DeCompressCapsule(entryname, entryMeta, 1) <= 0 || !entryMeta) return 0;
+
+        std::vector<int> matchedDicIndices;
+        char buffer[MAX_VALUE_LEN];
+        for(int i=0; i< dicMeta->lines; i++){
+            int dicLen=0; int offset = GetDicOffsetByEntry(m_subpatterns[varId], i, dicLen);
+            RemovePadding(dicMeta->data + offset, dicLen, buffer);
+            char* e=nullptr; long v = strtol(buffer, &e, 10);
+            if(!(e && (*e=='\0' || isspace(*e)))) continue;
+            bool ok=false;
+            switch(op){
+                case 0: ok = (v == A); break;
+                case 1: ok = (v >  A); break;
+                case 2: ok = (v <  A); break;
+                case 3: ok = (v >= A); break;
+                case 4: ok = (v <= A); break;
+                case 5: ok = (v != A); break;
+                case 6: ok = (v >= A && v <= B); break;
+            }
+            if(ok) matchedDicIndices.push_back(i);
+        }
+        if(matchedDicIndices.empty()) return 0;
+
+        int matchedCount = 0; int entryLen = entryMeta->eleLen;
+        for(int idx : matchedDicIndices){
+            char paddingStr[MAX_DICENTY_LEN]; IntPadding(idx, entryLen, paddingStr);
+            matchedCount += QueryByBM_Pushdown_ForDic(entryname, paddingStr, 1, bitmap);
+        }
+        return matchedCount;
+    }
+
+    int varfname = varId + (varType == VAR_TYPE_SUB ? VAR_TYPE_SUB : VAR_TYPE_VAR);
     if(op==0){ char buf[64]; snprintf(buf,sizeof(buf),"%ld",A); int pass = CheckBloom(varfname, buf); if(pass==0) return 0; }
     Coffer* meta=nullptr; int ret = DeCompressCapsule(varfname, meta, 1); if(ret <= 0) return 0;
     int matched = 0;
